@@ -1,22 +1,90 @@
 # A small sphere scene, ray traced and served as a live page.
 #
-#   ~/.bend/bin/bend main.bend
+#   ~/.bend/bin/bend main.bend [side]
 #
-# Then open http://127.0.0.1:8080/
+# side is the width and height in pixels, a power of two from 1 to 4096.
+# The default is 128. Then open http://127.0.0.1:8080/
 # Moving the mouse orbits the camera. A click toggles a closer view.
 # Each frame is traced in this process and sent to the page.
 
 import Base
 
-# 2^depth on a side. 7 is 128, 8 is 256. The page reads this size.
-def depth() -> Nat:
-  7n
+# depth is log2(side). The picture is a square of that side.
+type Size is Data:
+  Size{depth: Nat, side: U32, f: F32}
 
-def side_u() -> U32:
-  128
+type Choice is Data:
+  Use{size: Size}
+  Reject{}
 
-def side_f() -> F32:
-  128.0
+type Pow is Data:
+  PowGo{n: U32, acc: Nat}
+  PowStop{out: Maybe<&2, Nat>}
+
+def pow_odd(+n: U32, acc: Nat, odd: Bool) -> Pow:
+  match odd:
+    case True{}:
+      PowStop{None{}}
+    case False{}:
+      PowGo{U32.shrn(n, 1n), 1n+acc}
+
+def pow_go(+n: U32, acc: Nat, one: Bool) -> Pow:
+  match one:
+    case True{}:
+      PowStop{Some{acc}}
+    case False{}:
+      pow_odd(n, acc, U32.is_eq(U32.and(n, 1), 1))
+
+def pow_depth(fuel: Nat, step: Pow) -> Maybe<&2, Nat>:
+  match fuel step:
+    case 0n PowStop{out}:
+      out
+    case 0n PowGo{n, acc}:
+      None{}
+    case 1n+left PowStop{out}:
+      out
+    case 1n+left PowGo{+n, acc}:
+      pow_depth(left, pow_go(n, acc, U32.is_eq(n, 1)))
+
+def default_size() -> Size:
+  Size{7n, 128, {128.0 : F32}}
+
+def choice_of(+n: U32, got: Maybe<&2, Nat>) -> Choice:
+  match got:
+    case None{}:
+      Reject{}
+    case Some{depth}:
+      Use{Size{depth, n, U32.to_f32(n)}}
+
+# 4096 is 2^12. Anything larger is rejected before the log walk.
+def choice_cap(n: U32, got: Maybe<&2, Nat>, big: Bool) -> Choice:
+  match big:
+    case True{}:
+      Reject{}
+    case False{}:
+      choice_of(n, got)
+
+def choice_read(got: Maybe<&2, U32>) -> Choice:
+  match got:
+    case None{}:
+      Reject{}
+    case Some{+n}:
+      choice_cap(n, pow_depth(32n, PowGo{n, 0n}), U32.is_lt(4096, n))
+
+def size_tail(tail: List<String>) -> Choice:
+  match tail:
+    case Nil{}:
+      Use{default_size()}
+    case a <> _:
+      choice_read(U32.read(a))
+
+# argv is the program, then an optional side.
+def size_args(args: List<String>) -> Choice:
+  match args:
+    case Nil{}:
+      Use{default_size()}
+    case _ <> tail:
+      size_tail(tail)
 
 type Vec3 is Data:
   V3{x: F32, y: F32, z: F32}
@@ -410,8 +478,8 @@ def flatten(rows: Rows, acc: List<&2, U32>) -> List<&2, U32>:
     case RCons{row, rest}:
       flatten(rest, onto(row, acc))
 
-def render(cam: Cam) -> List<&2, U32>:
-  List.reverse(&2, U32, flatten(block(depth(), 0, 0, side_u(), side_f(), cam), Nil{}))
+def render(depth: Nat, side: U32, f: F32, cam: Cam) -> List<&2, U32>:
+  List.reverse(&2, U32, flatten(block(depth, 0, 0, side, f, cam), Nil{}))
 
 # --- view -----------------------------------------------------------------
 # The page asks for /f SYYYY PPPP Z
@@ -466,9 +534,8 @@ def cam_of(v: View) -> Cam:
 
 # --- http -----------------------------------------------------------------
 
-def body_len() -> U32:
-  +s = side_u()
-  (s * s * 3 : U32)
+def body_len(+side: U32) -> U32:
+  (side * side * 3 : U32)
 
 def prepend_str(s: String, acc: List<&2, U32>) -> List<&2, U32>:
   match s:
@@ -483,9 +550,9 @@ def str_bytes(s: String) -> List<&2, U32>:
 def with_header(header: String, body: List<&2, U32>) -> List<&2, U32>:
   List.append(&2, U32, str_bytes(header), body)
 
-def frame_header() -> String:
+def frame_header(side: U32) -> String:
   "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: "
-    ++ U32.show(body_len())
+    ++ U32.show(body_len(side))
     ++ "\r\nConnection: close\r\n\r\n"
 
 def text_header(kind: String, n: Nat) -> String:
@@ -496,19 +563,19 @@ def text_header(kind: String, n: Nat) -> String:
 def not_found() -> String:
   "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
-def html_body() -> String:
+def html_body(+side: U32) -> String:
   "<!doctype html><html><head><meta charset='utf-8'><title>Sphere trace</title><style>"
     ++ "html,body{margin:0;height:100%;background:#12141a;color:#e8e6e1;font:15px sans-serif;}"
     ++ "body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;user-select:none;}"
     ++ "canvas{background:#000;cursor:crosshair;touch-action:none;}"
     ++ "p{margin:0;letter-spacing:.02em;opacity:.85;}"
     ++ "</style></head><body><canvas id='view' width='"
-    ++ U32.show(side_u())
+    ++ U32.show(side)
     ++ "' height='"
-    ++ U32.show(side_u())
+    ++ U32.show(side)
     ++ "'></canvas><p id='hud'>move to orbit, click to zoom</p><script>"
     ++ "const side = "
-    ++ U32.show(side_u())
+    ++ U32.show(side)
     ++ "; const canvas = document.getElementById('view');"
     ++ "const ctx = canvas.getContext('2d', {alpha:false});"
     ++ "const hud = document.getElementById('hud');"
@@ -537,9 +604,14 @@ def html_body() -> String:
     ++ "frames = 0; t0 = now; } } }"
     ++ "loop();</script></body></html>"
 
-def page() -> String:
-  +body = html_body()
+def page_of(+side: U32) -> String:
+  +body = html_body(side)
   text_header("text/html; charset=utf-8", String.length(body)) ++ body
+
+def page(size: Size) -> String:
+  match size:
+    case Size{depth, side, f}:
+      page_of(side)
 
 # A sent socket is closed, then the accept loop continues.
 def sent_then(
@@ -561,30 +633,38 @@ def send_text(listener: Listener, sock: Socket, text: String, next: Listener -> 
     sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send(sock, text)
     sent_then(sent, listener, next)
 
-def send_frame(listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit)) -> IO(Unit):
+def send_rendered(
+  depth: Nat, +side: U32, f: F32,
+  listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit)
+) -> IO(Unit):
   do IO<Unit>:
-    body : List<&2, U32> = render(cam_of(view))
-    sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send_bytes(sock, with_header(frame_header(), body))
+    body : List<&2, U32> = render(depth, side, f, cam_of(view))
+    sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send_bytes(sock, with_header(frame_header(side), body))
     sent_then(sent, listener, next)
 
-def route(path: String, listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
+def send_frame(size: Size, listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit)) -> IO(Unit):
+  match size:
+    case Size{depth, +side, f}:
+      send_rendered(depth, side, f, listener, sock, view, next)
+
+def route(size: Size, path: String, listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
   match path:
     case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{48}, rest}}}:
-      send_frame(listener, sock, view_of(48, rest), next)
+      send_frame(size, listener, sock, view_of(48, rest), next)
     case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{49}, rest}}}:
-      send_frame(listener, sock, view_of(49, rest), next)
+      send_frame(size, listener, sock, view_of(49, rest), next)
     case SCon{Chr{47}, SCon{Chr{32}, _}}:
-      send_text(listener, sock, page(), next)
+      send_text(listener, sock, page(size), next)
     case _:
       send_text(listener, sock, not_found(), next)
 
 def got_req(
-  listener: Listener, got: Socket & Result<&1, &1, U32 & String, Maybe<&1, String>>,
+  size: Size, listener: Listener, got: Socket & Result<&1, &1, U32 & String, Maybe<&1, String>>,
   next: Listener -> IO(Unit)
 ) -> IO(Unit):
   match got:
     case (sock, Done{Some{text}}):
-      route(String.drop(text, 4n), listener, sock, next)
+      route(size, String.drop(text, 4n), listener, sock, next)
     case (sock, Done{None{}}):
       do IO<Unit>:
         Unit <- Socket.close(sock)
@@ -594,36 +674,55 @@ def got_req(
         Unit <- Socket.close(sock)
         next(listener)
 
-def read_one(listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
+def read_one(size: Size, listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
   do IO<Unit>:
     got : Socket & Result<&1, &1, U32 & String, Maybe<&1, String>> <- TCP.recv(sock, 8192)
-    got_req(listener, got, next)
+    got_req(size, listener, got, next)
 
-def accepted(got: Listener & Result<&1, &1, U32 & String, Socket>, next: Listener -> IO(Unit)) -> IO(Unit):
+def accepted(size: Size, got: Listener & Result<&1, &1, U32 & String, Socket>, next: Listener -> IO(Unit)) -> IO(Unit):
   match got:
     case (listener, Done{sock}):
-      read_one(listener, sock, next)
+      read_one(size, listener, sock, next)
     case (listener, Fail{err}):
       do IO<Unit>:
         IO.print("accept ended")
         Listener.close(listener)
 
-def accept_one(listener: Listener, next: Listener -> IO(Unit)) -> IO(Unit):
+def accept_one(size: Size, listener: Listener, next: Listener -> IO(Unit)) -> IO(Unit):
   do IO<Unit>:
     got : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
-    accepted(got, next)
+    accepted(size, got, next)
 
-def serve(fuel: Nat, listener: Listener) -> IO(Unit):
+def serve(fuel: Nat, +size: Size, listener: Listener) -> IO(Unit):
   match fuel:
     case 0n:
       do IO<Unit>:
         IO.print("stopping")
         Listener.close(listener)
     case 1n+left:
-      accept_one(listener, l => serve(left, l))
+      accept_one(size, listener, l => serve(left, size, l))
+
+def side_of(size: Size) -> U32:
+  match size:
+    case Size{depth, side, f}:
+      side
+
+def listen(+size: Size) -> IO(Unit):
+  do IO<Unit>:
+    IO.print("ray tracer at http://127.0.0.1:8080/  side " ++ U32.show(side_of(size)))
+    listener : Listener <- IO.try(Listener, TCP.listen("127.0.0.1", 8080))
+    serve(4294967295n, size, listener)
+
+def run(picked: Choice) -> IO(Unit):
+  match picked:
+    case Reject{}:
+      do IO<Unit>:
+        IO.print_err("side must be a power of two from 1 to 4096, for example 128")
+        IO.exit(1)
+    case Use{size}:
+      listen(size)
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    IO.print("ray tracer at http://127.0.0.1:8080/")
-    listener : Listener <- IO.try(Listener, TCP.listen("127.0.0.1", 8080))
-    serve(4294967295n, listener)
+    args : List<String> <- IO.args()
+    run(size_args(args))
