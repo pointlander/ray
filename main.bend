@@ -1,23 +1,22 @@
-# A small sphere scene, ray traced.
+# A small sphere scene, ray traced and served as a live page.
 #
 #   ~/.bend/bin/bend main.bend
 #
-# Writes scene.ppm (P6, side x side) in the current directory.
-# The picture is a checker floor, three large spheres (clay, chrome,
-# plastic) and two small ones, lit by a sun and a fill light.
-# Reflections run for three hits; the next ray is the sky.
+# Then open http://127.0.0.1:8080/
+# Moving the mouse orbits the camera. A click toggles a closer view.
+# Each frame is traced in this process and sent to the page.
 
 import Base
 
-# 2^depth on a side. 7 is 128, 8 is 256.
+# 2^depth on a side. 7 is 128, 8 is 256. The page reads this size.
 def depth() -> Nat:
-  9n
+  7n
 
 def side_u() -> U32:
-  512
+  128
 
 def side_f() -> F32:
-  512.0
+  128.0
 
 type Vec3 is Data:
   V3{x: F32, y: F32, z: F32}
@@ -299,27 +298,47 @@ def trace(+n: Nat, step: Step) -> Vec3:
 
 # --- camera and pixels ----------------------------------------------------
 
-def cam_right(+fx: F32, +fy: F32, +fz: F32, right: Vec3) -> Cam:
+# Right is cross(forward, world up). Up of the camera is cross(right, forward).
+def cam_axes(
+  +ex: F32, +ey: F32, +ez: F32, +fx: F32, +fy: F32, +fz: F32, +sc: F32, right: Vec3
+) -> Cam:
   match right:
     case V3{+rx, +ry, +rz}:
       Cam{
-        0.05, 1.35, 4.10,
+        ex, ey, ez,
         fx, fy, fz,
         rx, ry, rz,
         (ry * fz - rz * fy : F32),
         (rz * fx - rx * fz : F32),
         (rx * fy - ry * fx : F32),
-        0.38
+        sc
       }
 
-def cam_fwd(fwd: Vec3) -> Cam:
+def cam_from_fwd(+ex: F32, +ey: F32, +ez: F32, +sc: F32, fwd: Vec3) -> Cam:
   match fwd:
     case V3{+fx, +fy, +fz}:
-      cam_right(fx, fy, fz, norm3(F32.neg(fz), 0.0, fx))
+      cam_axes(ex, ey, ez, fx, fy, fz, sc, norm3(F32.neg(fz), 0.0, fx))
 
-# eye (0.05, 1.35, 4.10), looking at (0, 0.35, 0). World up is +Y.
-def camera() -> Cam:
-  cam_fwd(norm3(F32.neg(0.05), F32.neg(1.0), F32.neg(4.10)))
+# Look from the eye toward the target. World up is +Y.
+def look_at(
+  +ex: F32, +ey: F32, +ez: F32, +tx: F32, +ty: F32, +tz: F32, +sc: F32
+) -> Cam:
+  cam_from_fwd(ex, ey, ez, sc, norm3((tx - ex : F32), (ty - ey : F32), (tz - ez : F32)))
+
+# Orbit the point the original picture looks at. yaw 0 is the front.
+def orbit(+yaw: F32, +pitch: F32, +dist: F32, +sc: F32) -> Cam:
+  +cp = F32.cos(pitch)
+  +sp = F32.sin(pitch)
+  +cy = F32.cos(yaw)
+  +sy = F32.sin(yaw)
+  +tx = {0.05 : F32}
+  +ty = {0.38 : F32}
+  +tz = {0.0 : F32}
+  look_at(
+    (tx + (dist * cp) * sy : F32),
+    (ty + dist * sp : F32),
+    (tz + (dist * cp) * cy : F32),
+    tx, ty, tz, sc)
 
 def shoot(ex: F32, ey: F32, ez: F32, dir: Vec3) -> U32:
   match dir:
@@ -391,35 +410,220 @@ def flatten(rows: Rows, acc: List<&2, U32>) -> List<&2, U32>:
     case RCons{row, rest}:
       flatten(rest, onto(row, acc))
 
-def render() -> List<&2, U32>:
-  List.reverse(&2, U32, flatten(block(depth(), 0, 0, side_u(), side_f(), camera()), Nil{}))
+def render(cam: Cam) -> List<&2, U32>:
+  List.reverse(&2, U32, flatten(block(depth(), 0, 0, side_u(), side_f(), cam), Nil{}))
 
-def ppm_header() -> String:
-  "P6\n" ++ U32.show(side_u()) ++ " " ++ U32.show(side_u()) ++ "\n255\n"
+# --- view -----------------------------------------------------------------
+# The page asks for /f SYYYY PPPP Z
+# S is 0 or 1 (yaw sign), YYYY and PPPP are thousandths, Z is 0 or 1.
 
-def die_write(file: File, code: U32, msg: String) -> IO(File):
-  do IO<File>:
-    Unit <- File.close(file)
-    IO.die(File, code, msg)
+type View is Data:
+  View{yaw: F32, pitch: F32, zoom: U32}
 
-def unwrap_write(step: File & Result<&1, &1, U32 & String, Unit>) -> IO(File):
-  match step:
-    case (file, Done{v}):
-      IO.pure(File, file)
-    case (file, Fail{(code, msg)}):
-      die_write(file, code, msg)
+def num_step(n: Nat, s: String, acc: U32) -> U32 & String:
+  match n s:
+    case 0n rest:
+      (acc, rest)
+    case 1n+p SCon{Chr{c}, t}:
+      num_step(p, t, ((acc * 10 + (c - 48)) : U32))
+    case _ rest:
+      (acc, rest)
+
+def yaw_of(sign: U32, mag: U32) -> F32:
+  +v = (U32.to_f32(mag) / 1000.0 : F32)
+  pick_f(U32.is_eq(sign, 49), F32.neg(v), v)
+
+def view_zoom(sign: U32, yaw_mag: U32, pitch_mag: U32, rest: String) -> View:
+  match rest:
+    case SCon{Chr{z}, _}:
+      View{yaw_of(sign, yaw_mag), (U32.to_f32(pitch_mag) / 1000.0 : F32), z}
+    case _:
+      View{{0.15 : F32}, {0.38 : F32}, 48}
+
+def view_pitch(sign: U32, yaw_mag: U32, got: U32 & String) -> View:
+  match got:
+    case (pitch_mag, rest):
+      view_zoom(sign, yaw_mag, pitch_mag, rest)
+
+def view_mag(sign: U32, got: U32 & String) -> View:
+  match got:
+    case (mag, rest):
+      view_pitch(sign, mag, num_step(4n, rest, 0))
+
+def view_of(sign: U32, s: String) -> View:
+  view_mag(sign, num_step(4n, s, 0))
+
+def dist_of(zoom: U32) -> F32:
+  pick_f(U32.is_eq(zoom, 49), {2.25 : F32}, {4.6 : F32})
+
+def fov_of(zoom: U32) -> F32:
+  pick_f(U32.is_eq(zoom, 49), {0.26 : F32}, {0.44 : F32})
+
+def cam_of(v: View) -> Cam:
+  match v:
+    case View{yaw, pitch, +zoom}:
+      orbit(yaw, F32.clamp(pitch, {0.12 : F32}, {1.12 : F32}), dist_of(zoom), fov_of(zoom))
+
+# --- http -----------------------------------------------------------------
+
+def body_len() -> U32:
+  +s = side_u()
+  (s * s * 3 : U32)
+
+def prepend_str(s: String, acc: List<&2, U32>) -> List<&2, U32>:
+  match s:
+    case SNil{}:
+      acc
+    case SCon{Chr{c}, t}:
+      prepend_str(t, c <> acc)
+
+def str_bytes(s: String) -> List<&2, U32>:
+  List.reverse(&2, U32, prepend_str(s, Nil{}))
+
+def with_header(header: String, body: List<&2, U32>) -> List<&2, U32>:
+  List.append(&2, U32, str_bytes(header), body)
+
+def frame_header() -> String:
+  "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: "
+    ++ U32.show(body_len())
+    ++ "\r\nConnection: close\r\n\r\n"
+
+def text_header(kind: String, n: Nat) -> String:
+  "HTTP/1.1 200 OK\r\nContent-Type: " ++ kind ++ "\r\nCache-Control: no-store\r\nContent-Length: "
+    ++ Nat.show(n)
+    ++ "\r\nConnection: close\r\n\r\n"
+
+def not_found() -> String:
+  "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+def html_body() -> String:
+  "<!doctype html><html><head><meta charset='utf-8'><title>Sphere trace</title><style>"
+    ++ "html,body{margin:0;height:100%;background:#12141a;color:#e8e6e1;font:15px sans-serif;}"
+    ++ "body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;user-select:none;}"
+    ++ "canvas{width:min(92vh,92vw);height:min(92vh,92vw);background:#000;cursor:crosshair;image-rendering:pixelated;touch-action:none;border-radius:8px;}"
+    ++ "p{margin:0;letter-spacing:.02em;opacity:.85;}"
+    ++ "</style></head><body><canvas id='view' width='"
+    ++ U32.show(side_u())
+    ++ "' height='"
+    ++ U32.show(side_u())
+    ++ "'></canvas><p id='hud'>move to orbit, click to zoom</p><script>"
+    ++ "const side = "
+    ++ U32.show(side_u())
+    ++ "; const canvas = document.getElementById('view');"
+    ++ "const ctx = canvas.getContext('2d', {alpha:false});"
+    ++ "const hud = document.getElementById('hud');"
+    ++ "let yaw = 0.15; let pitch = 0.38; let zoom = 0;"
+    ++ "function pad(n){const s = String(Math.max(0, Math.min(9999, n|0))); return '0000'.slice(s.length) + s;}"
+    ++ "function path(){const ys = yaw < 0 ? '1' : '0'; return '/f' + ys + pad(Math.round(Math.abs(yaw)*1000)) + pad(Math.round(pitch*1000)) + (zoom ? '1' : '0');}"
+    ++ "function look(e){const r = canvas.getBoundingClientRect();"
+    ++ "let nx = ((e.clientX - r.left) / r.width) * 2 - 1;"
+    ++ "let ny = 1 - ((e.clientY - r.top) / r.height) * 2;"
+    ++ "if (nx < -1) nx = -1; if (nx > 1) nx = 1; if (ny < -1) ny = -1; if (ny > 1) ny = 1;"
+    ++ "yaw = nx * 2.6; pitch = 0.46 + ny * 0.48;}"
+    ++ "window.addEventListener('pointermove', look);"
+    ++ "window.addEventListener('pointerdown', function(e){ zoom = zoom ? 0 : 1; look(e); });"
+    ++ "const img = ctx.createImageData(side, side);"
+    ++ "let frames = 0; let t0 = performance.now();"
+    ++ "async function loop(){for(;;){"
+    ++ "let buf; try { const res = await fetch(path(), {cache:'no-store'}); buf = new Uint8Array(await res.arrayBuffer()); }"
+    ++ "catch(e){ await new Promise(function(r){ setTimeout(r, 200); }); continue; }"
+    ++ "if (buf.length !== side*side*3) continue;"
+    ++ "const d = img.data; let j = 0;"
+    ++ "for (let i = 0; i < buf.length; i += 3){ d[j++] = buf[i]; d[j++] = buf[i+1]; d[j++] = buf[i+2]; d[j++] = 255; }"
+    ++ "ctx.putImageData(img, 0, 0); frames++;"
+    ++ "const now = performance.now();"
+    ++ "if (now - t0 >= 500){ const fps = (frames * 1000 / (now - t0)).toFixed(1);"
+    ++ "hud.textContent = fps + ' fps  -  move the mouse to orbit, click to zoom ' + (zoom ? '(close)' : '(wide)');"
+    ++ "frames = 0; t0 = now; } } }"
+    ++ "loop();</script></body></html>"
+
+def page() -> String:
+  +body = html_body()
+  text_header("text/html; charset=utf-8", String.length(body)) ++ body
+
+# A sent socket is closed, then the accept loop continues.
+def sent_then(
+  sent: Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit>,
+  listener: Listener, next: Listener -> IO(Unit)
+) -> IO(Unit):
+  match sent:
+    case (sock, Done{v}):
+      do IO<Unit>:
+        Unit <- Socket.close(sock)
+        next(listener)
+    case (sock, Fail{err}):
+      do IO<Unit>:
+        Unit <- Socket.close(sock)
+        next(listener)
+
+def send_text(listener: Listener, sock: Socket, text: String, next: Listener -> IO(Unit)) -> IO(Unit):
+  do IO<Unit>:
+    sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send(sock, text)
+    sent_then(sent, listener, next)
+
+def send_frame(listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit)) -> IO(Unit):
+  do IO<Unit>:
+    body : List<&2, U32> = render(cam_of(view))
+    sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send_bytes(sock, with_header(frame_header(), body))
+    sent_then(sent, listener, next)
+
+def route(path: String, listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
+  match path:
+    case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{48}, rest}}}:
+      send_frame(listener, sock, view_of(48, rest), next)
+    case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{49}, rest}}}:
+      send_frame(listener, sock, view_of(49, rest), next)
+    case SCon{Chr{47}, SCon{Chr{32}, _}}:
+      send_text(listener, sock, page(), next)
+    case _:
+      send_text(listener, sock, not_found(), next)
+
+def got_req(
+  listener: Listener, got: Socket & Result<&1, &1, U32 & String, Maybe<&1, String>>,
+  next: Listener -> IO(Unit)
+) -> IO(Unit):
+  match got:
+    case (sock, Done{Some{text}}):
+      route(String.drop(text, 4n), listener, sock, next)
+    case (sock, Done{None{}}):
+      do IO<Unit>:
+        Unit <- Socket.close(sock)
+        next(listener)
+    case (sock, Fail{err}):
+      do IO<Unit>:
+        Unit <- Socket.close(sock)
+        next(listener)
+
+def read_one(listener: Listener, sock: Socket, next: Listener -> IO(Unit)) -> IO(Unit):
+  do IO<Unit>:
+    got : Socket & Result<&1, &1, U32 & String, Maybe<&1, String>> <- TCP.recv(sock, 8192)
+    got_req(listener, got, next)
+
+def accepted(got: Listener & Result<&1, &1, U32 & String, Socket>, next: Listener -> IO(Unit)) -> IO(Unit):
+  match got:
+    case (listener, Done{sock}):
+      read_one(listener, sock, next)
+    case (listener, Fail{err}):
+      do IO<Unit>:
+        IO.print("accept ended")
+        Listener.close(listener)
+
+def accept_one(listener: Listener, next: Listener -> IO(Unit)) -> IO(Unit):
+  do IO<Unit>:
+    got : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
+    accepted(got, next)
+
+def serve(fuel: Nat, listener: Listener) -> IO(Unit):
+  match fuel:
+    case 0n:
+      do IO<Unit>:
+        IO.print("stopping")
+        Listener.close(listener)
+    case 1n+left:
+      accept_one(listener, l => serve(left, l))
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    t0 : Nat <- IO.now()
-    IO.print("tracing " ++ U32.show(side_u()) ++ "x" ++ U32.show(side_u()))
-    body : List<&2, U32> = render()
-    t1 : Nat <- IO.now()
-    IO.print("traced in " ++ Nat.show(Nat.sub(t1, t0)) ++ " ms")
-    file : File <- IO.try(File, File.open("scene.ppm", "w"))
-    w1 : File & Result<&1, &1, U32 & String, Unit> <- File.write(file, ppm_header())
-    file2 : File <- unwrap_write(w1)
-    w2 : File & Result<&1, &1, U32 & String, Unit> <- File.write_bytes(file2, body)
-    file3 : File <- unwrap_write(w2)
-    File.close(file3)
-    IO.print("wrote scene.ppm")
+    IO.print("ray tracer at http://127.0.0.1:8080/")
+    listener : Listener <- IO.try(Listener, TCP.listen("127.0.0.1", 8080))
+    serve(4294967295n, listener)
