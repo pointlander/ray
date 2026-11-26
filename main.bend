@@ -500,7 +500,7 @@ def html_body() -> String:
   "<!doctype html><html><head><meta charset='utf-8'><title>Sphere trace</title><style>"
     ++ "html,body{margin:0;height:100%;background:#12141a;color:#e8e6e1;font:15px sans-serif;}"
     ++ "body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;user-select:none;}"
-    ++ "canvas{width:min(92vh,92vw);height:min(92vh,92vw);background:#000;cursor:crosshair;image-rendering:pixelated;touch-action:none;border-radius:8px;}"
+    ++ "canvas{background:#000;cursor:crosshair;touch-action:none;}"
     ++ "p{margin:0;letter-spacing:.02em;opacity:.85;}"
     ++ "</style></head><body><canvas id='view' width='"
     ++ U32.show(side_u())
