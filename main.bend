@@ -1,6 +1,7 @@
 # A sphere scene and a tree, ray traced through a binary tree of spheres and served as a live page.
-# The trunk and branches are conical frustums. The leaves are flat triangles.
-# The sphere tree is built once. Every pixel, shadow, and reflection walks it.
+# The trunk and branches are conical frustums with bark. The leaves are flat,
+# textured, and translucent. The sphere tree is built once. Every pixel, shadow,
+# and reflection walks it.
 #
 #   ~/.bend/bin/bend main.bend [side]
 #
@@ -91,10 +92,15 @@ def size_args(args: List<String>) -> Choice:
 type Vec3 is Data:
   V3{x: F32, y: F32, z: F32}
 
-# t is the ray distance. The normal faces outward. refl is 0..1.
+# t is the ray distance. The normal faces the incoming ray. refl is 0..1.
+# thru is 0 on an opaque surface. A leaf lets that fraction of the ray through.
 type Hit is Data:
   Miss{}
-  Hit{t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32, cr: F32, cg: F32, cb: F32, refl: F32}
+  Hit{t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32, cr: F32, cg: F32, cb: F32, refl: F32, thru: F32}
+
+# Bark or a leaf writes its shaded normal and colour through one of these.
+type Tint is Data:
+  Tint{nx: F32, ny: F32, nz: F32, cr: F32, cg: F32, cb: F32}
 
 # A conical frustum from a to b, closed by discs. ra is the radius at a, rb at b.
 type Cyl is Data:
@@ -220,23 +226,23 @@ def choose_t(+disc: F32, +half_b: F32, neg: Bool) -> F32:
 
 def keep_near(
   +t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32,
-  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+  cr: F32, cg: F32, cb: F32, refl: F32, thru: F32, best: Hit
 ) -> Hit:
   match best:
     case Miss{}:
-      Bool.pick(Hit, (t > 0.001 : F32), Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}, Miss{})
-    case Hit{+bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl}:
+      Bool.pick(Hit, (t > 0.001 : F32), Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, thru}, Miss{})
+    case Hit{+bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl, bthru}:
       Bool.pick(Hit,
         (t > 0.001 : F32) && (t < bt : F32),
-        Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl},
-        Hit{bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl})
+        Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, thru},
+        Hit{bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl, bthru})
 
 def use_color(
   col: Vec3, t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32, refl: F32, best: Hit
 ) -> Hit:
   match col:
     case V3{cr, cg, cb}:
-      keep_near(t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, best)
+      keep_near(t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, 0.0, best)
 
 # kind 0 is a flat colour. kind 1 is the checker, and cr/cg/cb are ignored.
 def hit_sph(
@@ -335,16 +341,6 @@ def cyl_perp(
     dv, ov
   }
 
-def side_commit_n(
-  +t: F32, n: Vec3, cr: F32, cg: F32, cb: F32, refl: F32,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
-) -> Hit:
-  match n:
-    case V3{nx, ny, nz}:
-      keep_near(
-        t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
-        nx, ny, nz, cr, cg, cb, refl, best)
-
 def len3(+x: F32, +y: F32, +z: F32) -> F32:
   F32.sqrt((x * x + y * y + z * z : F32))
 
@@ -359,18 +355,127 @@ def cone_normal(
     ((ry / scale) - (k * vy) : F32),
     ((rz / scale) - (k * vz) : F32))
 
+# A vertical trunk would zero a cross with world up, so that case uses world X.
+def bark_up(steep: Bool) -> Vec3:
+  match steep:
+    case True{}:
+      V3{1.0, 0.0, 0.0}
+    case False{}:
+      V3{0.0, 1.0, 0.0}
+
+def frame_tan(+vx: F32, +vy: F32, +vz: F32, up: Vec3) -> Vec3:
+  match up:
+    case V3{+ux, +uy, +uz}:
+      norm3(
+        (vy * uz - vz * uy : F32),
+        (vz * ux - vx * uz : F32),
+        (vx * uy - vy * ux : F32))
+
+def frame_bit(+vx: F32, +vy: F32, +vz: F32, tan: Vec3) -> Vec3:
+  match tan:
+    case V3{+tx, +ty, +tz}:
+      V3{
+        (vy * tz - vz * ty : F32),
+        (vz * tx - vx * tz : F32),
+        (vx * ty - vy * tx : F32)
+      }
+
+def bark_ang(+rx: F32, +ry: F32, +rz: F32, tan: Vec3, bit: Vec3) -> F32:
+  match tan bit:
+    case V3{tx, ty, tz} V3{bx, by, bz}:
+      F32.atan2(
+        (rx * bx + ry * by + rz * bz : F32),
+        (rx * tx + ry * ty + rz * tz : F32))
+
+def sign_f(+s: F32) -> F32:
+  pick_f((s > 0.0 : F32), 1.0, F32.neg(1.0))
+
+def bark_tone(+plate: F32, +grain: F32) -> F32:
+  (0.42 + plate * 0.78 + grain : F32)
+
+# Cracks stay dark and a little redder. Plates are the light ridges. lent are the pores.
+def bark_color(+cr: F32, +cg: F32, +cb: F32, +tone: F32, +plate: F32, +lent: F32) -> Vec3:
+  V3{
+    (cr * tone + (1.0 - plate) * 0.08 + lent * 0.50 : F32),
+    (cg * tone + lent * 0.40 : F32),
+    (cb * tone * (0.70 + plate * 0.30) + lent * 0.22 : F32)
+  }
+
+def bark_n(n: Vec3, bit: Vec3, axis: Vec3, +slope: F32, +rip: F32) -> Vec3:
+  match n bit axis:
+    case V3{nx, ny, nz} V3{bx, by, bz} V3{vx, vy, vz}:
+      norm3(
+        (nx + bx * slope + vx * rip : F32),
+        (ny + by * slope + vy * rip : F32),
+        (nz + bz * slope + vz * rip : F32))
+
+def tint_of(n: Vec3, c: Vec3) -> Tint:
+  match n c:
+    case V3{nx, ny, nz} V3{cr, cg, cb}:
+      Tint{nx, ny, nz, cr, cg, cb}
+
+# Six furrows around the limb, wandering along it. The groove is the dark half of the wave.
+def bark_finish(
+  +ang: F32, +along: F32,
+  +cr: F32, +cg: F32, +cb: F32,
+  n: Vec3, bit: Vec3, axis: Vec3
+) -> Tint:
+  +phase = (ang * 6.0 + F32.sin((along * 3.4 : F32)) * 1.3 : F32)
+  +s = F32.sin(phase)
+  +plate = F32.abs(s)
+  +slope = (F32.cos(phase) * sign_f(s) * 0.42 : F32)
+  +rip = (F32.cos((along * 52.0 + ang * 2.0 : F32)) * 0.08 : F32)
+  +grain = (F32.cos((along * 40.0 : F32)) * 0.15 : F32)
+  +lent = max0((F32.sin((ang * 14.0 : F32)) * F32.sin((along * 19.0 : F32)) - 0.62 : F32))
+  tint_of(
+    bark_n(n, bit, axis, slope, rip),
+    bark_color(cr, cg, cb, bark_tone(plate, grain), plate, lent))
+
+def bark_shade(
+  +rx: F32, +ry: F32, +rz: F32, +along: F32,
+  +vx: F32, +vy: F32, +vz: F32,
+  +cr: F32, +cg: F32, +cb: F32,
+  n: Vec3, +tan: Vec3
+) -> Tint:
+  +bit = frame_bit(vx, vy, vz, tan)
+  bark_finish(
+    bark_ang(rx, ry, rz, tan, bit), along, cr, cg, cb, n, bit, V3{vx, vy, vz})
+
+def bark_tint(
+  +rx: F32, +ry: F32, +rz: F32, +along: F32,
+  +k: F32, +vx: F32, +vy: F32, +vz: F32,
+  +cr: F32, +cg: F32, +cb: F32
+) -> Tint:
+  bark_shade(
+    rx, ry, rz, along, vx, vy, vz, cr, cg, cb,
+    cone_normal(rx, ry, rz, k, vx, vy, vz),
+    frame_tan(vx, vy, vz, bark_up((F32.abs(vy) > 0.85 : F32))))
+
+def bark_commit(
+  +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  tint: Tint, refl: F32, best: Hit
+) -> Hit:
+  match tint:
+    case Tint{nx, ny, nz, cr, cg, cb}:
+      keep_near(
+        t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
+        nx, ny, nz, cr, cg, cb, refl, 0.0, best)
+
 def cone_commit(
   +t: F32, +dpx: F32, +dpy: F32, +dpz: F32, +opx: F32, +opy: F32, +opz: F32,
-  +k: F32, +vx: F32, +vy: F32, +vz: F32,
+  +k: F32, +vx: F32, +vy: F32, +vz: F32, +dv: F32, +ov: F32,
   cr: F32, cg: F32, cb: F32, refl: F32,
   +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
 ) -> Hit:
-  side_commit_n(
-    t,
-    cone_normal(
-      (opx + (t * dpx) : F32), (opy + (t * dpy) : F32), (opz + (t * dpz) : F32),
-      k, vx, vy, vz),
-    cr, cg, cb, refl, ox, oy, oz, dx, dy, dz, best)
+  bark_commit(
+    t, ox, oy, oz, dx, dy, dz,
+    bark_tint(
+      (opx + (t * dpx) : F32),
+      (opy + (t * dpy) : F32),
+      (opz + (t * dpz) : F32),
+      (ov + (t * dv) : F32),
+      k, vx, vy, vz, cr, cg, cb),
+    refl, best)
 
 # Radius along the axis is ra + k * s. k is (rb - ra) / length.
 def hit_side_from(
@@ -391,7 +496,7 @@ def hit_side_from(
       +disc = (b * b - (a * c) : F32)
       cone_commit(
         side_choose(tiny(a), a, b, c, disc, dv, ov, h),
-        dpx, dpy, dpz, opx, opy, opz, k, vx, vy, vz,
+        dpx, dpy, dpz, opx, opy, opz, k, vx, vy, vz, dv, ov,
         cr, cg, cb, refl, ox, oy, oz, dx, dy, dz, best)
 
 def hit_side(
@@ -434,7 +539,7 @@ def cap_commit(
 ) -> Hit:
   keep_near(
     t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
-    nx, ny, nz, cr, cg, cb, refl, best)
+    nx, ny, nz, cr, cg, cb, refl, 0.0, best)
 
 def hit_cap(
   +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
@@ -515,23 +620,63 @@ def unit_face(v: Vec3) -> Vec3:
     case V3{x, y, z}:
       norm3(x, y, z)
 
+# Half the light goes through a leaf. The blade still reads, and the sky behind it greens.
+def leaf_thru() -> F32:
+  0.5
+
+# across is 0 on the midrib (u = v) and about 1 at either edge. A tiny span is the stem.
+def span_across(+u: F32, +v: F32, skip: Bool) -> F32:
+  match skip:
+    case True{}:
+      0.0
+    case False{}:
+      ((u - v) / (u + v) : F32)
+
+def leaf_color(
+  +u: F32, +v: F32, +px: F32, +py: F32, +pz: F32, +cr: F32, +cg: F32, +cb: F32
+) -> Vec3:
+  +span = (u + v : F32)
+  +w = (1.0 - span : F32)
+  +across = span_across(u, v, (span < 0.04 : F32))
+  +rib = max0((0.22 - F32.abs(across) : F32))
+  +mix = F32.clamp((rib * 5.0 : F32), 0.0, 1.0)
+  +edge = F32.min(u, F32.min(v, max0(w)))
+  +rim = max0((0.12 - edge : F32))
+  +shade = (1.0 - F32.min((rim * 5.0 : F32), 0.72) : F32)
+  +mottle = (F32.sin((px * 17.0 + py * 9.0 + pz * 13.0 : F32)) * 0.12 + w * 0.08 : F32)
+  +gain = (shade * (1.0 + mottle) : F32)
+  +kr = ((1.0 - mix) * cr + mix * 0.72 : F32)
+  +kg = ((1.0 - mix) * cg + mix * 0.78 : F32)
+  +kb = ((1.0 - mix) * cb + mix * 0.28 : F32)
+  V3{(kr * gain : F32), (kg * gain : F32), (kb * gain : F32)}
+
+def leaf_hit(
+  col: Vec3, t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32, refl: F32, best: Hit
+) -> Hit:
+  match col:
+    case V3{cr, cg, cb}:
+      keep_near(t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, leaf_thru(), best)
+
 def tri_shade_f(
   +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
-  n: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+  +u: F32, +v: F32, n: Vec3, +cr: F32, +cg: F32, +cb: F32, refl: F32, best: Hit
 ) -> Hit:
   match n:
     case V3{nx, ny, nz}:
-      keep_near(
-        t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
-        nx, ny, nz, cr, cg, cb, refl, best)
+      +px = (ox + (dx * t) : F32)
+      +py = (oy + (dy * t) : F32)
+      +pz = (oz + (dz * t) : F32)
+      leaf_hit(leaf_color(u, v, px, py, pz, cr, cg, cb), t, px, py, pz, nx, ny, nz, refl, best)
 
 def tri_shade(
   +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
-  raw: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+  +u: F32, +v: F32, raw: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
 ) -> Hit:
   match raw:
     case V3{+nx, +ny, +nz}:
-      tri_shade_f(t, ox, oy, oz, dx, dy, dz, unit_face(face_vec(nx, ny, nz, dx, dy, dz)), cr, cg, cb, refl, best)
+      tri_shade_f(
+        t, ox, oy, oz, dx, dy, dz, u, v,
+        unit_face(face_vec(nx, ny, nz, dx, dy, dz)), cr, cg, cb, refl, best)
 
 def tri_q(
   +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
@@ -543,7 +688,7 @@ def tri_q(
       +v = (dot3(dx, dy, dz, qx, qy, qz) * inv : F32)
       +t = (dot3(e2x, e2y, e2z, qx, qy, qz) * inv : F32)
       tri_shade(
-        tri_ok(t, u, v), ox, oy, oz, dx, dy, dz,
+        tri_ok(t, u, v), ox, oy, oz, dx, dy, dz, u, v,
         cross3(e1x, e1y, e1z, e2x, e2y, e2z), cr, cg, cb, refl, best)
 
 def tri_solve(
@@ -785,13 +930,6 @@ def sphere_row() -> List<&2, Knot>:
 def ground_tip() -> Knot:
   orb_tip(0.0, F32.neg(100.0), 0.0, 100.0, 0.0, 0.0, 0.0, 0.18, 1)
 
-def block_saw(h: Hit) -> Bool:
-  match h:
-    case Miss{}:
-      False{}
-    case Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}:
-      True{}
-
 def hit_shape(
   shape: Shape, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
 ) -> Hit:
@@ -827,9 +965,6 @@ def walk(
 def closest(+tree: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Hit:
   walk(tree, touches(tree, ox, oy, oz, dx, dy, dz), ox, oy, oz, dx, dy, dz, Miss{})
 
-def blocked(+tree: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Bool:
-  block_saw(closest(tree, ox, oy, oz, dx, dy, dz))
-
 def branches() -> List<&2, Cyl>:
   Cyl{F32.neg(1.90), F32.neg(0.02), F32.neg(1.25), F32.neg(1.90), 0.46, F32.neg(1.25), 0.155, 0.112, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.90), 0.46, F32.neg(1.25), F32.neg(1.90), 0.92, F32.neg(1.25), 0.112, 0.070, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.90), 0.92, F32.neg(1.25), F32.neg(1.90), 1.36, F32.neg(1.25), 0.070, 0.038, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.87), 0.36, F32.neg(1.13), F32.neg(1.80), 0.68, F32.neg(0.76), 0.056, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.80), 0.68, F32.neg(0.76), F32.neg(1.92), 0.84, F32.neg(0.53), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.80), 0.68, F32.neg(0.76), F32.neg(1.55), 0.92, F32.neg(0.57), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.80), 0.48, F32.neg(1.20), F32.neg(1.41), 0.86, F32.neg(0.99), 0.051, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.41), 0.86, F32.neg(0.99), F32.neg(1.28), 1.02, F32.neg(0.76), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.41), 0.86, F32.neg(0.99), F32.neg(1.08), 1.10, F32.neg(1.03), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.81), 0.56, F32.neg(1.30), F32.neg(1.39), 0.90, F32.neg(1.52), 0.047, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.39), 0.90, F32.neg(1.52), F32.neg(1.09), 1.06, F32.neg(1.49), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.39), 0.90, F32.neg(1.52), F32.neg(1.24), 1.14, F32.neg(1.78), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.88), 0.64, F32.neg(1.34), F32.neg(1.78), 1.06, F32.neg(1.80), 0.044, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.78), 1.06, F32.neg(1.80), F32.neg(1.56), 1.22, F32.neg(1.97), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.78), 1.06, F32.neg(1.80), F32.neg(1.92), 1.30, F32.neg(2.06), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.95), 0.74, F32.neg(1.32), F32.neg(2.19), 1.10, F32.neg(1.68), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.19), 1.10, F32.neg(1.68), F32.neg(2.18), 1.26, F32.neg(1.94), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.19), 1.10, F32.neg(1.68), F32.neg(2.51), 1.34, F32.neg(1.78), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.98), 0.82, F32.neg(1.26), F32.neg(2.40), 1.22, F32.neg(1.32), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.40), 1.22, F32.neg(1.32), F32.neg(2.61), 1.38, F32.neg(1.50), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.40), 1.22, F32.neg(1.32), F32.neg(2.70), 1.46, F32.neg(1.19), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.95), 0.92, F32.neg(1.20), F32.neg(2.24), 1.36, F32.neg(0.94), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.24), 1.36, F32.neg(0.94), F32.neg(2.54), 1.52, F32.neg(0.91), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.24), 1.36, F32.neg(0.94), F32.neg(2.32), 1.60, F32.neg(0.66), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.87), 1.04, F32.neg(1.20), F32.neg(1.73), 1.50, F32.neg(0.93), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.73), 1.50, F32.neg(0.93), F32.neg(1.77), 1.66, F32.neg(0.68), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.73), 1.50, F32.neg(0.93), F32.neg(1.43), 1.74, F32.neg(0.80), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Nil{})))))))))))))))))))))))))))
 
@@ -846,29 +981,42 @@ def scene() -> Knot:
         List.append(&2, Knot, beams_of(branches()), blades_of(leaves())))),
     ground_tip())
 
-def vis_of(in_shadow: Bool) -> F32:
-  match in_shadow:
-    case True{}:
-      0.0
-    case False{}:
+# A leaf in front of the light lets its thru fraction through. Anything solid blocks.
+def saw_vis(h: Hit) -> F32:
+  match h:
+    case Miss{}:
       1.0
+    case Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, +thru}:
+      pick_f((thru > 0.02 : F32), thru, 0.0)
+
+def light_vis(
+  +tree: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
+) -> F32:
+  saw_vis(closest(tree, ox, oy, oz, dx, dy, dz))
 
 # Sun from the upper right, fill from the upper left. spec rides on the sun only.
+# A leaf also glows when the sun is behind it and nothing solid blocks that side.
 def surface(
   +px: F32, +py: F32, +pz: F32, +nx: F32, +ny: F32, +nz: F32,
   +cr: F32, +cg: F32, +cb: F32, +dx: F32, +dy: F32, +dz: F32,
-  tree: Knot
+  +thru: F32, +tree: Knot
 ) -> Vec3:
   +eps = {0.02 : F32}
-  +ox = (px + nx * eps : F32)
-  +oy = (py + ny * eps : F32)
-  +oz = (pz + nz * eps : F32)
+  +ox = (px + (nx * eps) : F32)
+  +oy = (py + (ny * eps) : F32)
+  +oz = (pz + (nz * eps) : F32)
+  +bx = (px - (nx * eps) : F32)
+  +by = (py - (ny * eps) : F32)
+  +bz = (pz - (nz * eps) : F32)
   +lx = {F32.neg(0.31701148) : F32}
   +ly = {0.81014045 : F32}
   +lz = {F32.neg(0.49312897) : F32}
-  +ndotl = max0((nx * lx + ny * ly + nz * lz : F32))
+  +nl = (nx * lx + ny * ly + nz * lz : F32)
+  +ndotl = max0(nl)
   +ndotf = max0((nx * 0.57543534 + ny * 0.51789180 + nz * 0.63297887 : F32))
-  +vis = vis_of(blocked(tree, ox, oy, oz, lx, ly, lz))
+  +vis = light_vis(tree, ox, oy, oz, lx, ly, lz)
+  +bvis = light_vis(tree, bx, by, bz, lx, ly, lz)
+  +glow = (max0(F32.neg(nl)) * bvis * pick_f((thru > 0.02 : F32), 1.35, 0.0) : F32)
   +rx = ((ndotl * (nx * 2.0)) - lx : F32)
   +ry = ((ndotl * (ny * 2.0)) - ly : F32)
   +rz = ((ndotl * (nz * 2.0)) - lz : F32)
@@ -876,14 +1024,37 @@ def surface(
   +spec = (F32.pow(vd, 56.0) * ndotl * vis : F32)
   +lit = (0.11 + ndotl * vis * 1.10 + ndotf * 0.24 : F32)
   V3{
-    (cr * lit + spec * 0.90 : F32),
-    (cg * lit + spec * 0.86 : F32),
-    (cb * lit + spec * 0.76 : F32)
+    (cr * lit + spec * 0.90 + glow * 0.85 : F32),
+    (cg * lit + spec * 0.86 + glow * 1.05 : F32),
+    (cb * lit + spec * 0.76 + glow * 0.25 : F32)
   }
+
+# Green the light that has passed through a leaf. An opaque bounce stays as it is.
+def beer_tint(+cr: F32, +cg: F32, +cb: F32, far: Vec3) -> Vec3:
+  match far:
+    case V3{rr, rg, rb}:
+      V3{
+        (rr * (0.45 + (cr * 0.8) : F32) : F32),
+        (rg * (0.35 + (cg * 0.9) : F32) : F32),
+        (rb * (0.25 + (cb * 0.55) : F32) : F32)
+      }
+
+def beer(leaf: Bool, +cr: F32, +cg: F32, +cb: F32, far: Vec3) -> Vec3:
+  match leaf:
+    case True{}:
+      beer_tint(cr, cg, cb, far)
+    case False{}:
+      far
+
+def shade_bounce(
+  leaf: Bool, +cr: F32, +cg: F32, +cb: F32, lit: Vec3, far: Vec3, +w: F32
+) -> Vec3:
+  mix3(lit, beer(leaf, cr, cg, cb, far), w)
 
 # Go fires a ray. Saw has already intersected it. Folding both into one def
 # keeps the bounce recursive without a second function calling back.
 # Two steps of n make one bounce, so trace starts at 6n: three hits, then sky.
+# A leaf continues the ray through the blade. Anything else reflects.
 type Step is Data:
   Go{ox: F32, oy: F32, oz: F32, dx: F32, dy: F32, dz: F32}
   Saw{hit: Hit, dx: F32, dy: F32, dz: F32}
@@ -894,23 +1065,28 @@ def trace(+n: Nat, step: Step, +tree: Knot) -> Vec3:
       sky(dx, dy, dz)
     case 0n Saw{Miss{}, dx, dy, dz}:
       sky(dx, dy, dz)
-    case 0n Saw{Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}, dx, dy, dz}:
+    case 0n Saw{Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, thru}, dx, dy, dz}:
       sky(dx, dy, dz)
     case 1n+p Go{ox, oy, oz, +dx, +dy, +dz}:
       trace(p, Saw{closest(tree, ox, oy, oz, dx, dy, dz), dx, dy, dz}, tree)
     case 1n+p Saw{Miss{}, dx, dy, dz}:
       sky(dx, dy, dz)
-    case 1n+p Saw{Hit{t, +px, +py, +pz, +nx, +ny, +nz, cr, cg, cb, refl}, +dx, +dy, +dz}:
+    case 1n+p Saw{Hit{t, +px, +py, +pz, +nx, +ny, +nz, +cr, +cg, +cb, refl, +thru}, +dx, +dy, +dz}:
+      +leaf = (thru > 0.02 : F32)
       +eps = {0.02 : F32}
-      +ox = (px + nx * eps : F32)
-      +oy = (py + ny * eps : F32)
-      +oz = (pz + nz * eps : F32)
+      +ox = pick_f(leaf, (px + (dx * 0.05) - (nx * 0.02) : F32), (px + (nx * eps) : F32))
+      +oy = pick_f(leaf, (py + (dy * 0.05) - (ny * 0.02) : F32), (py + (ny * eps) : F32))
+      +oz = pick_f(leaf, (pz + (dz * 0.05) - (nz * 0.02) : F32), (pz + (nz * eps) : F32))
       +nd = (dx * nx + dy * ny + dz * nz : F32)
       +k = (nd * 2.0 : F32)
-      mix3(
-        surface(px, py, pz, nx, ny, nz, cr, cg, cb, dx, dy, dz, tree),
-        trace(p, Go{ox, oy, oz, (dx - k * nx : F32), (dy - k * ny : F32), (dz - k * nz : F32)}, tree),
-        refl)
+      +rdx = pick_f(leaf, dx, (dx - (k * nx) : F32))
+      +rdy = pick_f(leaf, dy, (dy - (k * ny) : F32))
+      +rdz = pick_f(leaf, dz, (dz - (k * nz) : F32))
+      shade_bounce(
+        leaf, cr, cg, cb,
+        surface(px, py, pz, nx, ny, nz, cr, cg, cb, dx, dy, dz, thru, tree),
+        trace(p, Go{ox, oy, oz, rdx, rdy, rdz}, tree),
+        pick_f(leaf, thru, refl))
 
 # --- camera and pixels ----------------------------------------------------
 
