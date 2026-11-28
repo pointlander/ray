@@ -1,6 +1,6 @@
-# A sphere scene and a tree, ray traced from a sparse voxel octree and served as a live page.
+# A sphere scene and a tree, ray traced through a binary tree of spheres and served as a live page.
 # The trunk and branches are conical frustums. The leaves are flat triangles.
-# The octree is built once. Every pixel, shadow, and reflection marches it.
+# The sphere tree is built once. Every pixel, shadow, and reflection walks it.
 #
 #   ~/.bend/bin/bend main.bend [side]
 #
@@ -105,41 +105,19 @@ type Tri is Data:
   Tri{ax: F32, ay: F32, az: F32, bx: F32, by: F32, bz: F32, cx: F32, cy: F32, cz: F32, cr: F32, cg: F32, cb: F32, refl: F32}
 
 # Perpendicular parts of a ray against a cylinder axis. dv and ov are the axis dots.
-# Sparse voxel octree. Children are indexed by x in bit 0, y in bit 1, z in bit 2.
-# A leaf stores the surface that painted it: colour, reflectance, and outward normal.
-type Vox is Data:
-  Air{}
-  Leaf{cr: F32, cg: F32, cb: F32, refl: F32, nx: F32, ny: F32, nz: F32}
-  Fork{c0: Vox, c1: Vox, c2: Vox, c3: Vox, c4: Vox, c5: Vox, c6: Vox, c7: Vox}
+# A binary tree of spheres. A tip holds one shape inside its bounding sphere.
+# A fork's sphere covers both children. kind 1 on an orb is the checker floor.
+type Shape is Data:
+  Orb{cx: F32, cy: F32, cz: F32, rad: F32, cr: F32, cg: F32, cb: F32, refl: F32, kind: U32}
+  Beam{cyl: Cyl}
+  Blade{tri: Tri}
 
-# One primitive being painted into the octree. Later paints overwrite earlier leaves.
-type Job is Data:
-  Floor{}
-  Ball{cx: F32, cy: F32, cz: F32, rad: F32, cr: F32, cg: F32, cb: F32, refl: F32}
-  Beam{ax: F32, ay: F32, az: F32, bx: F32, by: F32, bz: F32, ra: F32, rb: F32, cr: F32, cg: F32, cb: F32, refl: F32}
-  Blade{ax: F32, ay: F32, az: F32, bx: F32, by: F32, bz: F32, cx: F32, cy: F32, cz: F32, cr: F32, cg: F32, cb: F32, refl: F32}
+type Knot is Data:
+  Tip{sx: F32, sy: F32, sz: F32, sr: F32, shape: Shape}
+  Bin{sx: F32, sy: F32, sz: F32, sr: F32, a: Knot, b: Knot}
 
-# One node the ray still has siblings inside. Planes tx, ty, tz are the next
-# crossing of that axis, or a far sentinel once that axis has been stepped.
-type Frame is Data:
-  Frame{
-    c0: Vox, c1: Vox, c2: Vox, c3: Vox, c4: Vox, c5: Vox, c6: Vox, c7: Vox,
-    bx: F32, by: F32, bz: F32, sz: F32,
-    tx: F32, ty: F32, tz: F32, t1: F32,
-    cx: Bool, cy: Bool, cz: Bool
-  }
-
-type March is Data:
-  Down{node: Vox, bx: F32, by: F32, bz: F32, sz: F32, t0: F32, t1: F32, stack: List<&2, Frame>}
-  Side{frame: Frame, stack: List<&2, Frame>}
-  Found{hit: Hit}
-
-type Span is Data:
-  Span{lo: F32, hi: F32}
-
-# Closest point on a segment. t is 0 at a and 1 at b.
-type Near is Data:
-  Near{t: F32, dist: F32, qx: F32, qy: F32, qz: F32}
+type Sphere is Data:
+  Sphere{x: F32, y: F32, z: F32, r: F32}
 
 type Perp is Data:
   Perp{dpx: F32, dpy: F32, dpz: F32, opx: F32, opy: F32, opz: F32, dv: F32, ov: F32}
@@ -215,52 +193,162 @@ def checker(+px: F32, +pz: F32) -> Vec3:
   +b = F32.sin((pz * 6.2831855 : F32))
   checker_tone((a * b < 0.0 : F32))
 
-# --- sparse voxel octree --------------------------------------------------
-# The world cube is [-4, 4] x [-0.5, 7.5] x [-4, 4], split seven times.
-# A leaf is 1/16 of a unit. Empty space stays Air, so the tree is sparse.
+def color_of(chk: Bool, px: F32, pz: F32, cr: F32, cg: F32, cb: F32) -> Vec3:
+  match chk:
+    case False{}:
+      V3{cr, cg, cb}
+    case True{}:
+      checker(px, pz)
 
-def vol_x() -> F32:
-  F32.neg(4.0)
+def surface_color(kind: U32, +px: F32, +pz: F32, cr: F32, cg: F32, cb: F32) -> Vec3:
+  color_of(U32.is_eq(kind, 1), px, pz, cr, cg, cb)
 
-def vol_y() -> F32:
-  F32.neg(0.5)
+# --- rays and spheres -----------------------------------------------------
 
-def vol_z() -> F32:
-  F32.neg(4.0)
+def near_t(+half_b: F32, +sq: F32) -> F32:
+  +t0 = (F32.neg(half_b) - sq : F32)
+  +t1 = (F32.neg(half_b) + sq : F32)
+  pick_f((t0 > 0.001 : F32), t0, pick_f((t1 > 0.001 : F32), t1, F32.neg(1.0)))
 
-def vol_s() -> F32:
-  8.0
+# Nearest positive root of t^2 + 2*half_b*t + c = 0, or -1 on a miss.
+def choose_t(+disc: F32, +half_b: F32, neg: Bool) -> F32:
+  match neg:
+    case True{}:
+      F32.neg(1.0)
+    case False{}:
+      near_t(half_b, F32.sqrt(disc))
 
-def vol_n() -> Nat:
-  7n
+def keep_near(
+  +t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match best:
+    case Miss{}:
+      Bool.pick(Hit, (t > 0.001 : F32), Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}, Miss{})
+    case Hit{+bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl}:
+      Bool.pick(Hit,
+        (t > 0.001 : F32) && (t < bt : F32),
+        Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl},
+        Hit{bt, bpx, bpy, bpz, bnx, bny, bnz, bcr, bcg, bcb, brefl})
 
-def far_t() -> F32:
-  1000000.0
+def use_color(
+  col: Vec3, t: F32, px: F32, py: F32, pz: F32, nx: F32, ny: F32, nz: F32, refl: F32, best: Hit
+) -> Hit:
+  match col:
+    case V3{cr, cg, cb}:
+      keep_near(t, px, py, pz, nx, ny, nz, cr, cg, cb, refl, best)
 
-def len3(+x: F32, +y: F32, +z: F32) -> F32:
-  F32.sqrt((x * x + y * y + z * z : F32))
+# kind 0 is a flat colour. kind 1 is the checker, and cr/cg/cb are ignored.
+def hit_sph(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +cx: F32, +cy: F32, +cz: F32, +rad: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32, kind: U32, best: Hit
+) -> Hit:
+  +ocx = (ox - cx : F32)
+  +ocy = (oy - cy : F32)
+  +ocz = (oz - cz : F32)
+  +half_b = (ocx * dx + ocy * dy + ocz * dz : F32)
+  +c = (ocx * ocx + ocy * ocy + ocz * ocz - rad * rad : F32)
+  +disc = (half_b * half_b - c : F32)
+  +t = choose_t(disc, half_b, (disc < 0.0 : F32))
+  +px = (ox + dx * t : F32)
+  +py = (oy + dy * t : F32)
+  +pz = (oz + dz * t : F32)
+  +inv = (1.0 / rad : F32)
+  +nx = ((px - cx) * inv : F32)
+  +ny = ((py - cy) * inv : F32)
+  +nz = ((pz - cz) * inv : F32)
+  use_color(surface_color(kind, px, pz, cr, cg, cb), t, px, py, pz, nx, ny, nz, refl, best)
 
-def dot3(+ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32) -> F32:
-  (ax * bx + ay * by + az * bz : F32)
+def sph_blocks(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +cx: F32, +cy: F32, +cz: F32, +rad: F32
+) -> Bool:
+  +ocx = (ox - cx : F32)
+  +ocy = (oy - cy : F32)
+  +ocz = (oz - cz : F32)
+  +half_b = (ocx * dx + ocy * dy + ocz * dz : F32)
+  +c = (ocx * ocx + ocy * ocy + ocz * ocz - rad * rad : F32)
+  +disc = (half_b * half_b - c : F32)
+  +t = choose_t(disc, half_b, (disc < 0.0 : F32))
+  (t > 0.001 : F32)
+
+# --- frustums and triangles -----------------------------------------------
+
+def nearer(+a: F32, +b: F32) -> F32:
+  pick_f((a < 0.0 : F32), b, pick_f((b < 0.0 : F32), a, pick_f((a < b : F32), a, b)))
+
+def accept_axial(+t: F32, +along: F32, +h: F32) -> F32:
+  pick_f(
+    (t > 0.001 : F32) && (along > F32.neg(0.001) : F32) && (along < (h + 0.001) : F32),
+    t, F32.neg(1.0))
+
+def side_pair(+a: F32, +hb: F32, +sq: F32, +dv: F32, +ov: F32, +h: F32) -> F32:
+  +inv = (1.0 / a : F32)
+  +t0 = ((F32.neg(hb) - sq) * inv : F32)
+  +t1 = ((F32.neg(hb) + sq) * inv : F32)
+  nearer(
+    accept_axial(t0, (ov + (t0 * dv) : F32), h),
+    accept_axial(t1, (ov + (t1 * dv) : F32), h))
+
+# bad skips the square root. The quadratic is A t^2 + 2 B t + C = 0.
+def side_roots(+a: F32, +hb: F32, +disc: F32, +dv: F32, +ov: F32, +h: F32, bad: Bool) -> F32:
+  match bad:
+    case True{}:
+      F32.neg(1.0)
+    case False{}:
+      side_pair(a, hb, F32.sqrt(disc), dv, ov, h)
 
 def tiny(+d: F32) -> Bool:
   (d < 0.0001 : F32) && (d > F32.neg(0.0001) : F32)
 
-def div_or(+numer: F32, +denom: F32, skip: Bool) -> F32:
-  match skip:
+# One root when the ray runs along the cone, so the t^2 term drops out.
+def side_linear(+b: F32, +c: F32, +dv: F32, +ov: F32, +h: F32, flat: Bool) -> F32:
+  match flat:
     case True{}:
       F32.neg(1.0)
     case False{}:
-      (numer / denom : F32)
+      +t = (F32.neg(c) / (b + b) : F32)
+      accept_axial(t, (ov + (t * dv) : F32), h)
 
-def div_big(+numer: F32, +denom: F32, skip: Bool) -> F32:
-  match skip:
+def side_choose(
+  flat: Bool, +a: F32, +b: F32, +c: F32, +disc: F32, +dv: F32, +ov: F32, +h: F32
+) -> F32:
+  match flat:
     case True{}:
-      far_t()
+      side_linear(b, c, dv, ov, h, tiny(b))
     case False{}:
-      (numer / denom : F32)
+      side_roots(a, b, disc, dv, ov, h, (disc < 0.0 : F32))
 
-# Outward normal of a cone. k is dr/ds along the unit axis.
+def cyl_perp(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32, +vx: F32, +vy: F32, +vz: F32
+) -> Perp:
+  +ocx = (ox - ax : F32)
+  +ocy = (oy - ay : F32)
+  +ocz = (oz - az : F32)
+  +dv = (dx * vx + dy * vy + dz * vz : F32)
+  +ov = (ocx * vx + ocy * vy + ocz * vz : F32)
+  Perp{
+    (dx - (vx * dv) : F32), (dy - (vy * dv) : F32), (dz - (vz * dv) : F32),
+    (ocx - (vx * ov) : F32), (ocy - (vy * ov) : F32), (ocz - (vz * ov) : F32),
+    dv, ov
+  }
+
+def side_commit_n(
+  +t: F32, n: Vec3, cr: F32, cg: F32, cb: F32, refl: F32,
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
+) -> Hit:
+  match n:
+    case V3{nx, ny, nz}:
+      keep_near(
+        t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
+        nx, ny, nz, cr, cg, cb, refl, best)
+
+def len3(+x: F32, +y: F32, +z: F32) -> F32:
+  F32.sqrt((x * x + y * y + z * z : F32))
+
+# Outward normal. k is dr/ds along the axis, so the normal leans with the taper.
 def cone_normal(
   +rx: F32, +ry: F32, +rz: F32, +k: F32, +vx: F32, +vy: F32, +vz: F32
 ) -> Vec3:
@@ -270,6 +358,147 @@ def cone_normal(
     ((rx / scale) - (k * vx) : F32),
     ((ry / scale) - (k * vy) : F32),
     ((rz / scale) - (k * vz) : F32))
+
+def cone_commit(
+  +t: F32, +dpx: F32, +dpy: F32, +dpz: F32, +opx: F32, +opy: F32, +opz: F32,
+  +k: F32, +vx: F32, +vy: F32, +vz: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32,
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
+) -> Hit:
+  side_commit_n(
+    t,
+    cone_normal(
+      (opx + (t * dpx) : F32), (opy + (t * dpy) : F32), (opz + (t * dpz) : F32),
+      k, vx, vy, vz),
+    cr, cg, cb, refl, ox, oy, oz, dx, dy, dz, best)
+
+# Radius along the axis is ra + k * s. k is (rb - ra) / length.
+def hit_side_from(
+  p: Perp, +h: F32, +ra: F32, +k: F32, +vx: F32, +vy: F32, +vz: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32,
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
+) -> Hit:
+  match p:
+    case Perp{+dpx, +dpy, +dpz, +opx, +opy, +opz, +dv, +ov}:
+      +ap = (dpx * dpx + dpy * dpy + dpz * dpz : F32)
+      +hb = (dpx * opx + dpy * opy + dpz * opz : F32)
+      +cp = (opx * opx + opy * opy + opz * opz : F32)
+      +m = (ra + (k * ov) : F32)
+      +n = (k * dv : F32)
+      +a = (ap - (n * n) : F32)
+      +b = (hb - (m * n) : F32)
+      +c = (cp - (m * m) : F32)
+      +disc = (b * b - (a * c) : F32)
+      cone_commit(
+        side_choose(tiny(a), a, b, c, disc, dv, ov, h),
+        dpx, dpy, dpz, opx, opy, opz, k, vx, vy, vz,
+        cr, cg, cb, refl, ox, oy, oz, dx, dy, dz, best)
+
+def hit_side(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32, +vx: F32, +vy: F32, +vz: F32,
+  +h: F32, +ra: F32, +k: F32, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  hit_side_from(
+    cyl_perp(ox, oy, oz, dx, dy, dz, ax, ay, az, vx, vy, vz),
+    h, ra, k, vx, vy, vz, cr, cg, cb, refl, ox, oy, oz, dx, dy, dz, best)
+
+def div_or(+numer: F32, +denom: F32, skip: Bool) -> F32:
+  match skip:
+    case True{}:
+      F32.neg(1.0)
+    case False{}:
+      (numer / denom : F32)
+
+def cap_keep(+t: F32, +dd: F32, +r2: F32) -> F32:
+  pick_f((t > 0.001 : F32) && (dd <= r2 : F32), t, F32.neg(1.0))
+
+def cap_t(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +cx: F32, +cy: F32, +cz: F32, +nx: F32, +ny: F32, +nz: F32, +rad: F32
+) -> F32:
+  +denom = (dx * nx + dy * ny + dz * nz : F32)
+  +numer = ((cx - ox) * nx + (cy - oy) * ny + (cz - oz) * nz : F32)
+  +t = div_or(numer, denom, tiny(denom))
+  +px = (ox + (dx * t) : F32)
+  +py = (oy + (dy * t) : F32)
+  +pz = (oz + (dz * t) : F32)
+  cap_keep(
+    t,
+    ((px - cx) * (px - cx) + (py - cy) * (py - cy) + (pz - cz) * (pz - cz) : F32),
+    (rad * rad : F32))
+
+def cap_commit(
+  +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  nx: F32, ny: F32, nz: F32, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  keep_near(
+    t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
+    nx, ny, nz, cr, cg, cb, refl, best)
+
+def hit_cap(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +cx: F32, +cy: F32, +cz: F32, +nx: F32, +ny: F32, +nz: F32, +rad: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  cap_commit(
+    cap_t(ox, oy, oz, dx, dy, dz, cx, cy, cz, nx, ny, nz, rad),
+    ox, oy, oz, dx, dy, dz, nx, ny, nz, cr, cg, cb, refl, best)
+
+def hit_cyl_axis(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32,
+  +ra: F32, +rb: F32, +k: F32, +h: F32, axis: Vec3,
+  +cr: F32, +cg: F32, +cb: F32, +refl: F32, best: Hit
+) -> Hit:
+  match axis:
+    case V3{+vx, +vy, +vz}:
+      hit_cap(
+        ox, oy, oz, dx, dy, dz, ax, ay, az, F32.neg(vx), F32.neg(vy), F32.neg(vz), ra,
+        cr, cg, cb, refl,
+        hit_cap(
+          ox, oy, oz, dx, dy, dz, bx, by, bz, vx, vy, vz, rb, cr, cg, cb, refl,
+          hit_side(
+            ox, oy, oz, dx, dy, dz, ax, ay, az, vx, vy, vz, h, ra, k,
+            cr, cg, cb, refl, best)))
+
+def hit_cyl_len(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32,
+  +ra: F32, +rb: F32, cr: F32, cg: F32, cb: F32, refl: F32, +h: F32, best: Hit
+) -> Hit:
+  hit_cyl_axis(
+    ox, oy, oz, dx, dy, dz, ax, ay, az, bx, by, bz, ra, rb,
+    ((rb - ra) / h : F32), h,
+    norm3((bx - ax : F32), (by - ay : F32), (bz - az : F32)),
+    cr, cg, cb, refl, best)
+
+def hit_cyl(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, cyl: Cyl, best: Hit
+) -> Hit:
+  match cyl:
+    case Cyl{+ax, +ay, +az, +bx, +by, +bz, +ra, +rb, cr, cg, cb, refl}:
+      hit_cyl_len(
+        ox, oy, oz, dx, dy, dz, ax, ay, az, bx, by, bz, ra, rb, cr, cg, cb, refl,
+        len3((bx - ax : F32), (by - ay : F32), (bz - az : F32)), best)
+
+def cross3(+ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32) -> Vec3:
+  V3{
+    (ay * bz - az * by : F32),
+    (az * bx - ax * bz : F32),
+    (ax * by - ay * bx : F32)
+  }
+
+def dot3(+ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32) -> F32:
+  (ax * bx + ay * by + az * bz : F32)
+
+def tri_parallel(+det: F32) -> Bool:
+  (det < 0.00001 : F32) && (det > F32.neg(0.00001) : F32)
+
+def tri_ok(+t: F32, +u: F32, +v: F32) -> F32:
+  pick_f(
+    (t > 0.001 : F32) && (u >= 0.0 : F32) && (v >= 0.0 : F32) && ((u + v) <= 1.0 : F32),
+    t, F32.neg(1.0))
 
 def face_pick(back: Bool, +nx: F32, +ny: F32, +nz: F32) -> Vec3:
   match back:
@@ -281,556 +510,280 @@ def face_pick(back: Bool, +nx: F32, +ny: F32, +nz: F32) -> Vec3:
 def face_vec(+nx: F32, +ny: F32, +nz: F32, +dx: F32, +dy: F32, +dz: F32) -> Vec3:
   face_pick((dot3(nx, ny, nz, dx, dy, dz) > 0.0 : F32), nx, ny, nz)
 
-def cell_c(+a: F32, +size: F32) -> F32:
-  (a + (size * 0.5) : F32)
+def unit_face(v: Vec3) -> Vec3:
+  match v:
+    case V3{x, y, z}:
+      norm3(x, y, z)
 
-def cell_pad(+size: F32) -> F32:
-  (size * 0.9 : F32)
-
-# --- segment and triangle distance ----------------------------------------
-
-def seg_near(
-  +px: F32, +py: F32, +pz: F32,
-  +ax: F32, +ay: F32, +az: F32,
-  +bx: F32, +by: F32, +bz: F32
-) -> Near:
-  +abx = (bx - ax : F32)
-  +aby = (by - ay : F32)
-  +abz = (bz - az : F32)
-  +ab2 = (abx * abx + aby * aby + abz * abz : F32)
-  +t = F32.clamp(
-    div_or(
-      dot3((px - ax : F32), (py - ay : F32), (pz - az : F32), abx, aby, abz),
-      ab2, tiny(ab2)),
-    0.0, 1.0)
-  +qx = (ax + (abx * t) : F32)
-  +qy = (ay + (aby * t) : F32)
-  +qz = (az + (abz * t) : F32)
-  Near{t, len3((px - qx : F32), (py - qy : F32), (pz - qz : F32)), qx, qy, qz}
-
-def near_dist(n: Near) -> F32:
-  match n:
-    case Near{t, dist, qx, qy, qz}:
-      dist
-
-def seg_dist(
-  +px: F32, +py: F32, +pz: F32,
-  +ax: F32, +ay: F32, +az: F32,
-  +bx: F32, +by: F32, +bz: F32
-) -> F32:
-  near_dist(seg_near(px, py, pz, ax, ay, az, bx, by, bz))
-
-def plane_abs(+nd: F32, +nlen: F32, flat: Bool) -> F32:
-  match flat:
-    case True{}:
-      far_t()
-    case False{}:
-      F32.abs((nd / nlen : F32))
-
-# Distance from a point to a triangle. Inside the prism it is the plane
-# distance. Outside it is the nearest edge, so a leaf stays diamond shaped.
-def tri_dist(
-  +px: F32, +py: F32, +pz: F32,
-  +ax: F32, +ay: F32, +az: F32,
-  +bx: F32, +by: F32, +bz: F32,
-  +cx: F32, +cy: F32, +cz: F32
-) -> F32:
-  +abx = (bx - ax : F32)
-  +aby = (by - ay : F32)
-  +abz = (bz - az : F32)
-  +acx = (cx - ax : F32)
-  +acy = (cy - ay : F32)
-  +acz = (cz - az : F32)
-  +apx = (px - ax : F32)
-  +apy = (py - ay : F32)
-  +apz = (pz - az : F32)
-  +d00 = dot3(abx, aby, abz, abx, aby, abz)
-  +d01 = dot3(abx, aby, abz, acx, acy, acz)
-  +d11 = dot3(acx, acy, acz, acx, acy, acz)
-  +d20 = dot3(abx, aby, abz, apx, apy, apz)
-  +d21 = dot3(acx, acy, acz, apx, apy, apz)
-  +den = (d00 * d11 - d01 * d01 : F32)
-  +inv = div_big(1.0, den, tiny(den))
-  +u = (((d11 * d20) - (d01 * d21) : F32) * inv : F32)
-  +v = (((d00 * d21) - (d01 * d20) : F32) * inv : F32)
-  +nx = (aby * acz - abz * acy : F32)
-  +ny = (abz * acx - abx * acz : F32)
-  +nz = (abx * acy - aby * acx : F32)
-  +nlen = len3(nx, ny, nz)
-  +inside = (u >= 0.0 : F32) && (v >= 0.0 : F32) && ((u + v) <= 1.0 : F32) && Bool.not(tiny(den))
-  pick_f(
-    inside,
-    plane_abs(dot3(nx, ny, nz, apx, apy, apz), nlen, tiny(nlen)),
-    F32.min(
-      seg_dist(px, py, pz, ax, ay, az, bx, by, bz),
-      F32.min(
-        seg_dist(px, py, pz, ax, ay, az, cx, cy, cz),
-        seg_dist(px, py, pz, bx, by, bz, cx, cy, cz))))
-
-# --- coverage and ink -----------------------------------------------------
-
-def ball_hit(
-  +x: F32, +y: F32, +z: F32, +size: F32,
-  +cx: F32, +cy: F32, +cz: F32, +rad: F32
-) -> Bool:
-  +h = cell_pad(size)
-  +dist = len3(
-    (cell_c(x, size) - cx : F32),
-    (cell_c(y, size) - cy : F32),
-    (cell_c(z, size) - cz : F32))
-  ((dist - h) <= rad : F32) && ((dist + h) >= rad : F32)
-
-def beam_cover(n: Near, +ra: F32, +rb: F32, +size: F32) -> Bool:
-  match n:
-    case Near{t, dist, qx, qy, qz}:
-      +rad = (ra + ((rb - ra) * t : F32) : F32)
-      (dist <= (rad + cell_pad(size) : F32) : F32)
-
-def beam_hit(
-  +x: F32, +y: F32, +z: F32, +size: F32,
-  +ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32, +ra: F32, +rb: F32
-) -> Bool:
-  beam_cover(
-    seg_near(cell_c(x, size), cell_c(y, size), cell_c(z, size), ax, ay, az, bx, by, bz),
-    ra, rb, size)
-
-def covers(+x: F32, +y: F32, +z: F32, +size: F32, job: Job) -> Bool:
-  match job:
-    case Floor{}:
-      (y < 0.0 : F32) && ((y + size) >= 0.0 : F32)
-    case Ball{+cx, +cy, +cz, +rad, cr, cg, cb, refl}:
-      ball_hit(x, y, z, size, cx, cy, cz, rad)
-    case Beam{+ax, +ay, +az, +bx, +by, +bz, +ra, +rb, cr, cg, cb, refl}:
-      beam_hit(x, y, z, size, ax, ay, az, bx, by, bz, ra, rb)
-    case Blade{+ax, +ay, +az, +bx, +by, +bz, +cx, +cy, +cz, cr, cg, cb, refl}:
-      (tri_dist(
-        cell_c(x, size), cell_c(y, size), cell_c(z, size),
-        ax, ay, az, bx, by, bz, cx, cy, cz) <= cell_pad(size) : F32)
-
-def floor_leaf(c: Vec3) -> Vox:
-  match c:
-    case V3{r, g, b}:
-      Leaf{r, g, b, 0.18, 0.0, 1.0, 0.0}
-
-def leaf_n(n: Vec3, cr: F32, cg: F32, cb: F32, refl: F32) -> Vox:
+def tri_shade_f(
+  +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  n: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
   match n:
     case V3{nx, ny, nz}:
-      Leaf{cr, cg, cb, refl, nx, ny, nz}
+      keep_near(
+        t, (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
+        nx, ny, nz, cr, cg, cb, refl, best)
 
-def beam_k(+rb: F32, +ra: F32, +h: F32, flat: Bool) -> F32:
+def tri_shade(
+  +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  raw: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match raw:
+    case V3{+nx, +ny, +nz}:
+      tri_shade_f(t, ox, oy, oz, dx, dy, dz, unit_face(face_vec(nx, ny, nz, dx, dy, dz)), cr, cg, cb, refl, best)
+
+def tri_q(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +e1x: F32, +e1y: F32, +e1z: F32, +e2x: F32, +e2y: F32, +e2z: F32,
+  +u: F32, +inv: F32, qvec: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match qvec:
+    case V3{+qx, +qy, +qz}:
+      +v = (dot3(dx, dy, dz, qx, qy, qz) * inv : F32)
+      +t = (dot3(e2x, e2y, e2z, qx, qy, qz) * inv : F32)
+      tri_shade(
+        tri_ok(t, u, v), ox, oy, oz, dx, dy, dz,
+        cross3(e1x, e1y, e1z, e2x, e2y, e2z), cr, cg, cb, refl, best)
+
+def tri_solve(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32,
+  +e1x: F32, +e1y: F32, +e1z: F32, +e2x: F32, +e2y: F32, +e2z: F32,
+  +px: F32, +py: F32, +pz: F32, +inv: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  +tvx = (ox - ax : F32)
+  +tvy = (oy - ay : F32)
+  +tvz = (oz - az : F32)
+  +u = (dot3(tvx, tvy, tvz, px, py, pz) * inv : F32)
+  tri_q(
+    ox, oy, oz, dx, dy, dz, e1x, e1y, e1z, e2x, e2y, e2z, u, inv,
+    cross3(tvx, tvy, tvz, e1x, e1y, e1z), cr, cg, cb, refl, best)
+
+def hit_tri_det(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32,
+  +e1x: F32, +e1y: F32, +e1z: F32, +e2x: F32, +e2y: F32, +e2z: F32,
+  +px: F32, +py: F32, +pz: F32, +det: F32, parallel: Bool,
+  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match parallel:
+    case True{}:
+      best
+    case False{}:
+      tri_solve(
+        ox, oy, oz, dx, dy, dz, ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z,
+        px, py, pz, (1.0 / det : F32), cr, cg, cb, refl, best)
+
+def hit_tri_p(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32,
+  +e1x: F32, +e1y: F32, +e1z: F32, +e2x: F32, +e2y: F32, +e2z: F32,
+  pvec: Vec3, cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match pvec:
+    case V3{+px, +py, +pz}:
+      +det = dot3(e1x, e1y, e1z, px, py, pz)
+      hit_tri_det(
+        ox, oy, oz, dx, dy, dz, ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z,
+        px, py, pz, det, tri_parallel(det), cr, cg, cb, refl, best)
+
+def hit_tri_e(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
+  +ax: F32, +ay: F32, +az: F32, e1: Vec3, e2: Vec3,
+  cr: F32, cg: F32, cb: F32, refl: F32, best: Hit
+) -> Hit:
+  match e1 e2:
+    case V3{+e1x, +e1y, +e1z} V3{+e2x, +e2y, +e2z}:
+      hit_tri_p(
+        ox, oy, oz, dx, dy, dz, ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z,
+        cross3(dx, dy, dz, e2x, e2y, e2z), cr, cg, cb, refl, best)
+
+def hit_tri(
+  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, tri: Tri, best: Hit
+) -> Hit:
+  match tri:
+    case Tri{+ax, +ay, +az, +bx, +by, +bz, +cx, +cy, +cz, cr, cg, cb, refl}:
+      hit_tri_e(
+        ox, oy, oz, dx, dy, dz, ax, ay, az,
+        V3{(bx - ax : F32), (by - ay : F32), (bz - az : F32)},
+        V3{(cx - ax : F32), (cy - ay : F32), (cz - az : F32)},
+        cr, cg, cb, refl, best)
+
+# --- binary tree of spheres ----------------------------------------------
+# Each node is a sphere. A tip stores one shape, and that sphere is the shape's
+# bound. A fork's sphere covers both children. Missing a sphere skips that side.
+
+def wider(+a: F32, +b: F32) -> F32:
+  pick_f((a > b : F32), a, b)
+
+def contained(+dist: F32, +outer: F32, +inner: F32) -> Bool:
+  ((dist + inner) <= outer : F32)
+
+# Pad the merged radius a little so a rounding error cannot hide a child.
+def merge_grow(
+  flat: Bool,
+  +ax: F32, +ay: F32, +az: F32, +ar: F32,
+  +bx: F32, +by: F32, +bz: F32, +br: F32,
+  +dist: F32
+) -> Sphere:
   match flat:
     case True{}:
-      0.0
+      Sphere{ax, ay, az, (wider(ar, br) + 0.01 : F32)}
     case False{}:
-      ((rb - ra) / h : F32)
+      +rad = (((dist + ar + br) / 2.0) + 0.01 : F32)
+      +t = ((rad - ar) / dist : F32)
+      Sphere{
+        (ax + (bx - ax) * t : F32),
+        (ay + (by - ay) * t : F32),
+        (az + (bz - az) * t : F32),
+        rad
+      }
 
-def axis_part(+ab: F32, +h: F32, +fallback: F32, flat: Bool) -> F32:
-  match flat:
-    case True{}:
-      fallback
-    case False{}:
-      (ab / h : F32)
+def merge_which(
+  a_holds: Bool, b_holds: Bool,
+  +ax: F32, +ay: F32, +az: F32, +ar: F32,
+  +bx: F32, +by: F32, +bz: F32, +br: F32,
+  +dist: F32
+) -> Sphere:
+  match a_holds b_holds:
+    case True{} _:
+      Sphere{ax, ay, az, (ar + 0.01 : F32)}
+    case False{} True{}:
+      Sphere{bx, by, bz, (br + 0.01 : F32)}
+    case False{} False{}:
+      merge_grow(tiny(dist), ax, ay, az, ar, bx, by, bz, br, dist)
 
-def beam_from(
-  n: Near, +x: F32, +y: F32, +z: F32, +size: F32,
-  +ax: F32, +ay: F32, +az: F32, +bx: F32, +by: F32, +bz: F32,
-  +ra: F32, +rb: F32, cr: F32, cg: F32, cb: F32, refl: F32
-) -> Vox:
-  match n:
-    case Near{t, dist, +qx, +qy, +qz}:
-      +abx = (bx - ax : F32)
-      +aby = (by - ay : F32)
-      +abz = (bz - az : F32)
-      +h = len3(abx, aby, abz)
-      +flat = tiny(h)
-      leaf_n(
-        cone_normal(
-          (cell_c(x, size) - qx : F32),
-          (cell_c(y, size) - qy : F32),
-          (cell_c(z, size) - qz : F32),
-          beam_k(rb, ra, h, flat),
-          axis_part(abx, h, 0.0, flat),
-          axis_part(aby, h, 1.0, flat),
-          axis_part(abz, h, 0.0, flat)),
-        cr, cg, cb, refl)
+def merge_sph(
+  +ax: F32, +ay: F32, +az: F32, +ar: F32,
+  +bx: F32, +by: F32, +bz: F32, +br: F32
+) -> Sphere:
+  +dist = len3((bx - ax : F32), (by - ay : F32), (bz - az : F32))
+  merge_which(
+    contained(dist, ar, br), contained(dist, br, ar),
+    ax, ay, az, ar, bx, by, bz, br, dist)
 
-def ink(+x: F32, +y: F32, +z: F32, +size: F32, job: Job) -> Vox:
-  match job:
-    case Floor{}:
-      floor_leaf(checker(cell_c(x, size), cell_c(z, size)))
-    case Ball{+cx, +cy, +cz, rad, cr, cg, cb, refl}:
-      leaf_n(norm3(
-        (cell_c(x, size) - cx : F32),
-        (cell_c(y, size) - cy : F32),
-        (cell_c(z, size) - cz : F32)), cr, cg, cb, refl)
-    case Beam{+ax, +ay, +az, +bx, +by, +bz, +ra, +rb, cr, cg, cb, refl}:
-      beam_from(
-        seg_near(cell_c(x, size), cell_c(y, size), cell_c(z, size), ax, ay, az, bx, by, bz),
-        x, y, z, size, ax, ay, az, bx, by, bz, ra, rb, cr, cg, cb, refl)
-    case Blade{+ax, +ay, +az, +bx, +by, +bz, +cx, +cy, +cz, cr, cg, cb, refl}:
-      leaf_n(norm3(
-        ((by - ay : F32) * (cz - az : F32) - (bz - az : F32) * (cy - ay : F32) : F32),
-        ((bz - az : F32) * (cx - ax : F32) - (bx - ax : F32) * (cz - az : F32) : F32),
-        ((bx - ax : F32) * (cy - ay : F32) - (by - ay : F32) * (cx - ax : F32) : F32)),
-        cr, cg, cb, refl)
+def opened(node: Knot) -> Sphere & Knot:
+  match node:
+    case Tip{+sx, +sy, +sz, +sr, shape}:
+      (Sphere{sx, sy, sz, sr}, Tip{sx, sy, sz, sr, shape})
+    case Bin{+sx, +sy, +sz, +sr, a, b}:
+      (Sphere{sx, sy, sz, sr}, Bin{sx, sy, sz, sr, a, b})
 
-# Paint one primitive. `hit` is covers() of this cell, passed in so the match
-# stays on parameters. A miss keeps the node. A hit at the last level overwrites
-# one leaf. Above that, the eight children are painted together.
-def paint(
-  +level: Nat, node: Vox, +x: F32, +y: F32, +z: F32, +size: F32, +job: Job, hit: Bool
-) -> Vox:
-  match level node hit:
-    case 0n kept False{}:
-      kept
-    case 0n _ True{}:
-      ink(x, y, z, size, job)
-    case 1n+p kept False{}:
-      kept
-    case 1n+p Air{} True{}:
-      +h = (size * 0.5 : F32)
-      +x1 = (x + h : F32)
-      +y1 = (y + h : F32)
-      +z1 = (z + h : F32)
-      k0 k1 k2 k3 k4 k5 k6 k7 = paint(p, Air{}, x, y, z, h, job, covers(x, y, z, h, job)) paint(p, Air{}, x1, y, z, h, job, covers(x1, y, z, h, job)) paint(p, Air{}, x, y1, z, h, job, covers(x, y1, z, h, job)) paint(p, Air{}, x1, y1, z, h, job, covers(x1, y1, z, h, job)) paint(p, Air{}, x, y, z1, h, job, covers(x, y, z1, h, job)) paint(p, Air{}, x1, y, z1, h, job, covers(x1, y, z1, h, job)) paint(p, Air{}, x, y1, z1, h, job, covers(x, y1, z1, h, job)) paint(p, Air{}, x1, y1, z1, h, job, covers(x1, y1, z1, h, job))
-      Fork{k0, k1, k2, k3, k4, k5, k6, k7}
-    case 1n+p Fork{c0, c1, c2, c3, c4, c5, c6, c7} True{}:
-      +h = (size * 0.5 : F32)
-      +x1 = (x + h : F32)
-      +y1 = (y + h : F32)
-      +z1 = (z + h : F32)
-      k0 k1 k2 k3 k4 k5 k6 k7 = paint(p, c0, x, y, z, h, job, covers(x, y, z, h, job)) paint(p, c1, x1, y, z, h, job, covers(x1, y, z, h, job)) paint(p, c2, x, y1, z, h, job, covers(x, y1, z, h, job)) paint(p, c3, x1, y1, z, h, job, covers(x1, y1, z, h, job)) paint(p, c4, x, y, z1, h, job, covers(x, y, z1, h, job)) paint(p, c5, x1, y, z1, h, job, covers(x1, y, z1, h, job)) paint(p, c6, x, y1, z1, h, job, covers(x, y1, z1, h, job)) paint(p, c7, x1, y1, z1, h, job, covers(x1, y1, z1, h, job))
-      Fork{k0, k1, k2, k3, k4, k5, k6, k7}
-    case 1n+p Leaf{cr, cg, cb, refl, nx, ny, nz} True{}:
-      Leaf{cr, cg, cb, refl, nx, ny, nz}
+def place(s: Sphere, a: Knot, b: Knot) -> Knot:
+  match s:
+    case Sphere{x, y, z, r}:
+      Bin{x, y, z, r, a, b}
 
-def paint_at(node: Vox, +job: Job) -> Vox:
-  paint(vol_n(), node, vol_x(), vol_y(), vol_z(), vol_s(), job, covers(vol_x(), vol_y(), vol_z(), vol_s(), job))
+def join_sph(sa: Sphere, sb: Sphere, a: Knot, b: Knot) -> Knot:
+  match sa sb:
+    case Sphere{ax, ay, az, ar} Sphere{bx, by, bz, br}:
+      place(merge_sph(ax, ay, az, ar, bx, by, bz, br), a, b)
 
-def paint_floor(node: Vox) -> Vox:
-  paint_at(node, Floor{})
+def join_b(sa: Sphere, a: Knot, gb: Sphere & Knot) -> Knot:
+  match gb:
+    case (sb, b):
+      join_sph(sa, sb, a, b)
 
-def paint_ball(
-  node: Vox, +cx: F32, +cy: F32, +cz: F32, +rad: F32,
-  +cr: F32, +cg: F32, +cb: F32, +refl: F32
-) -> Vox:
-  paint_at(node, Ball{cx, cy, cz, rad, cr, cg, cb, refl})
+def join_ab(ga: Sphere & Knot, gb: Sphere & Knot) -> Knot:
+  match ga:
+    case (sa, a):
+      join_b(sa, a, gb)
 
-def paint_one_cyl(cyl: Cyl, node: Vox) -> Vox:
+def join(a: Knot, b: Knot) -> Knot:
+  join_ab(opened(a), opened(b))
+
+def pair_acc(xs: List<&2, Knot>, acc: List<&2, Knot>) -> List<&2, Knot>:
+  match xs:
+    case Nil{}:
+      List.reverse(&2, Knot, acc)
+    case a <> Nil{}:
+      List.reverse(&2, Knot, a <> acc)
+    case a <> (b <> rest):
+      pair_acc(rest, join(a, b) <> acc)
+
+def spare_tip() -> Knot:
+  Tip{0.0, F32.neg(100.0), 0.0, 0.0, Orb{0.0, F32.neg(100.0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0}}
+
+def first_knot(keep: Knot, xs: List<&2, Knot>) -> Knot:
+  match xs:
+    case Nil{}:
+      keep
+    case _ <> t:
+      first_knot(keep, t)
+
+def first_or_spare(xs: List<&2, Knot>) -> Knot:
+  match xs:
+    case Nil{}:
+      spare_tip()
+    case h <> t:
+      first_knot(h, t)
+
+# Fuel counts pairing rounds. A singleton list stays a singleton until fuel ends.
+def fold_tree(fuel: Nat, xs: List<&2, Knot>) -> Knot:
+  match fuel:
+    case 0n:
+      first_or_spare(xs)
+    case 1n+p:
+      fold_tree(p, pair_acc(xs, Nil{}))
+
+def orb_tip(
+  +cx: F32, +cy: F32, +cz: F32, +rad: F32,
+  cr: F32, cg: F32, cb: F32, refl: F32, kind: U32
+) -> Knot:
+  Tip{cx, cy, cz, rad, Orb{cx, cy, cz, rad, cr, cg, cb, refl, kind}}
+
+def beam_tip(cyl: Cyl) -> Knot:
   match cyl:
-    case Cyl{+ax, +ay, +az, +bx, +by, +bz, +ra, +rb, +cr, +cg, +cb, +refl}:
-      paint_at(node, Beam{ax, ay, az, bx, by, bz, ra, rb, cr, cg, cb, refl})
+    case Cyl{+ax, +ay, +az, +bx, +by, +bz, +ra, +rb, cr, cg, cb, refl}:
+      +mx = (((ax + bx : F32) * 0.5) : F32)
+      +my = (((ay + by : F32) * 0.5) : F32)
+      +mz = (((az + bz : F32) * 0.5) : F32)
+      +half = (len3((bx - ax : F32), (by - ay : F32), (bz - az : F32)) * 0.5 : F32)
+      +rad = ((half + wider(ra, rb) : F32) + 0.01 : F32)
+      Tip{mx, my, mz, rad, Beam{Cyl{ax, ay, az, bx, by, bz, ra, rb, cr, cg, cb, refl}}}
 
-def paint_cyls(cs: List<&2, Cyl>, node: Vox) -> Vox:
+def far3(+a: F32, +b: F32, +c: F32) -> F32:
+  wider(a, wider(b, c))
+
+def blade_tip(tri: Tri) -> Knot:
+  match tri:
+    case Tri{+ax, +ay, +az, +bx, +by, +bz, +cx, +cy, +cz, cr, cg, cb, refl}:
+      +mx = ((((ax + bx : F32) + cx : F32) / 3.0) : F32)
+      +my = ((((ay + by : F32) + cy : F32) / 3.0) : F32)
+      +mz = ((((az + bz : F32) + cz : F32) / 3.0) : F32)
+      +rad = (far3(
+        len3((ax - mx : F32), (ay - my : F32), (az - mz : F32)),
+        len3((bx - mx : F32), (by - my : F32), (bz - mz : F32)),
+        len3((cx - mx : F32), (cy - my : F32), (cz - mz : F32))) + 0.01 : F32)
+      Tip{mx, my, mz, rad, Blade{Tri{ax, ay, az, bx, by, bz, cx, cy, cz, cr, cg, cb, refl}}}
+
+def beams_of(cs: List<&2, Cyl>) -> List<&2, Knot>:
   match cs:
     case Nil{}:
-      node
+      Nil{}
     case c <> rest:
-      paint_cyls(rest, paint_one_cyl(c, node))
+      beam_tip(c) <> beams_of(rest)
 
-def paint_one_tri(tri: Tri, node: Vox) -> Vox:
-  match tri:
-    case Tri{+ax, +ay, +az, +bx, +by, +bz, +cx, +cy, +cz, +cr, +cg, +cb, +refl}:
-      paint_at(node, Blade{ax, ay, az, bx, by, bz, cx, cy, cz, cr, cg, cb, refl})
-
-def paint_tris(ts: List<&2, Tri>, node: Vox) -> Vox:
+def blades_of(ts: List<&2, Tri>) -> List<&2, Knot>:
   match ts:
     case Nil{}:
-      node
+      Nil{}
     case tri <> rest:
-      paint_tris(rest, paint_one_tri(tri, node))
+      blade_tip(tri) <> blades_of(rest)
 
-# --- ray march ------------------------------------------------------------
-# The ray crosses a node through at most four children. Each step either
-# descends into the next child or pops back to the parent. A leaf counts only
-# when the ray enters it from outside, so a shadow ray skips the voxel it
-# starts in.
+def sphere_row() -> List<&2, Knot>:
+  orb_tip(F32.neg(1.05), 0.50, 0.15, 0.50, 0.86, 0.16, 0.12, 0.05, 0)
+    <> (orb_tip(0.15, 0.50, F32.neg(0.35), 0.50, 0.93, 0.93, 0.95, 0.90, 0)
+    <> (orb_tip(1.25, 0.50, 0.25, 0.50, 0.16, 0.32, 0.86, 0.22, 0)
+    <> (orb_tip(F32.neg(0.35), 0.22, 1.05, 0.22, 0.96, 0.66, 0.16, 0.38, 0)
+    <> (orb_tip(0.85, 0.18, 1.20, 0.18, 0.22, 0.72, 0.32, 0.12, 0)
+    <> Nil{}))))
 
-def span_of(neg: Bool, +a: F32, +b: F32) -> Span:
-  match neg:
-    case True{}:
-      Span{b, a}
-    case False{}:
-      Span{a, b}
-
-def out_span(outside: Bool) -> Span:
-  match outside:
-    case True{}:
-      Span{1.0, F32.neg(1.0)}
-    case False{}:
-      Span{F32.neg(far_t()), far_t()}
-
-def flat_span(flat: Bool, neg: Bool, +o: F32, +d: F32, +mn: F32, +mx: F32) -> Span:
-  match flat:
-    case True{}:
-      out_span((o < mn : F32) || (o > mx : F32))
-    case False{}:
-      span_of(neg, ((mn - o) / d : F32), ((mx - o) / d : F32))
-
-def axis_span(+o: F32, +d: F32, +mn: F32, +mx: F32) -> Span:
-  flat_span(tiny(d), (d < 0.0 : F32), o, d, mn, mx)
-
-def cast_span(sx: Span, sy: Span, sz: Span) -> Span:
-  match sx sy sz:
-    case Span{x0, x1} Span{y0, y1} Span{z0, z1}:
-      Span{F32.max(x0, F32.max(y0, z0)), F32.min(x1, F32.min(y1, z1))}
-
-def plane_t(+o: F32, +d: F32, +plane: F32) -> F32:
-  div_big((plane - o : F32), d, tiny(d))
-
-def past_mid(pos: Bool, +t: F32, +tm: F32) -> Bool:
-  match pos:
-    case True{}:
-      (t >= tm : F32)
-    case False{}:
-      (t <= tm : F32)
-
-def axis_high(flat: Bool, +pos: Bool, +t: F32, +tm: F32, +at: F32, +mid: F32) -> Bool:
-  match flat:
-    case True{}:
-      (at >= mid : F32)
-    case False{}:
-      past_mid(pos, t, tm)
-
-# The next plane inside this node. A far sentinel means the ray leaves the
-# node on this axis instead of crossing the middle.
-def axis_next(high: Bool, pos: Bool, +tm: F32) -> F32:
-  match high pos:
-    case False{} True{}:
-      tm
-    case True{} False{}:
-      tm
-    case False{} False{}:
-      far_t()
-    case True{} True{}:
-      far_t()
-
-def pick8(
-  cx: Bool, cy: Bool, cz: Bool,
-  +c0: Vox, +c1: Vox, +c2: Vox, +c3: Vox, +c4: Vox, +c5: Vox, +c6: Vox, +c7: Vox
-) -> Vox:
-  match cx cy cz:
-    case False{} False{} False{}:
-      c0
-    case True{} False{} False{}:
-      c1
-    case False{} True{} False{}:
-      c2
-    case True{} True{} False{}:
-      c3
-    case False{} False{} True{}:
-      c4
-    case True{} False{} True{}:
-      c5
-    case False{} True{} True{}:
-      c6
-    case True{} True{} True{}:
-      c7
-
-def pop_stack(stack: List<&2, Frame>) -> March:
-  match stack:
-    case Nil{}:
-      Found{Miss{}}
-    case frame <> rest:
-      Side{frame, rest}
-
-def bury(stack: List<&2, Frame>, hit: Hit) -> Hit:
-  match stack:
-    case Nil{}:
-      hit
-    case _ <> rest:
-      bury(rest, hit)
-
-def shade_hit(
-  n: Vec3, +t: F32, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32,
-  cr: F32, cg: F32, cb: F32, refl: F32
-) -> Hit:
-  match n:
-    case V3{nx, ny, nz}:
-      Hit{
-        t,
-        (ox + (dx * t) : F32), (oy + (dy * t) : F32), (oz + (dz * t) : F32),
-        nx, ny, nz, cr, cg, cb, refl
-      }
-
-def leaf_march(
-  near: Bool, +cr: F32, +cg: F32, +cb: F32, +refl: F32,
-  +nx: F32, +ny: F32, +nz: F32, +t: F32, stack: List<&2, Frame>,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> March:
-  match near:
-    case False{}:
-      pop_stack(stack)
-    case True{}:
-      Found{bury(stack, shade_hit(face_vec(nx, ny, nz, dx, dy, dz), t, ox, oy, oz, dx, dy, dz, cr, cg, cb, refl))}
-
-def step_bit(step: Bool, bit: Bool) -> Bool:
-  match step:
-    case True{}:
-      Bool.not(bit)
-    case False{}:
-      bit
-
-def step_plane(step: Bool, +tp: F32) -> F32:
-  match step:
-    case True{}:
-      far_t()
-    case False{}:
-      tp
-
-def on_plane(+tp: F32, +tn: F32, +t1: F32) -> Bool:
-  (tp <= (tn + 0.00001 : F32) : F32) && (tp < t1 : F32)
-
-def child_t(+tx: F32, +ty: F32, +tz: F32, +t1: F32) -> F32:
-  F32.min(tx, F32.min(ty, F32.min(tz, t1)))
-
-def stepped(
-  out: Bool,
-  +c0: Vox, +c1: Vox, +c2: Vox, +c3: Vox, +c4: Vox, +c5: Vox, +c6: Vox, +c7: Vox,
-  +bx: F32, +by: F32, +bz: F32, +sz: F32,
-  +tx: F32, +ty: F32, +tz: F32, +tn: F32, +t1: F32,
-  +cx: Bool, +cy: Bool, +cz: Bool,
-  stack: List<&2, Frame>
-) -> March:
-  match out:
-    case True{}:
-      pop_stack(stack)
-    case False{}:
-      +sx = on_plane(tx, tn, t1)
-      +sy = on_plane(ty, tn, t1)
-      +szb = on_plane(tz, tn, t1)
-      +nx = step_bit(sx, cx)
-      +ny = step_bit(sy, cy)
-      +nz = step_bit(szb, cz)
-      +ntx = step_plane(sx, tx)
-      +nty = step_plane(sy, ty)
-      +ntz = step_plane(szb, tz)
-      +h = (sz * 0.5 : F32)
-      Down{
-        pick8(nx, ny, nz, c0, c1, c2, c3, c4, c5, c6, c7),
-        pick_f(nx, (bx + h : F32), bx),
-        pick_f(ny, (by + h : F32), by),
-        pick_f(nz, (bz + h : F32), bz),
-        h, tn, child_t(ntx, nty, ntz, t1),
-        (Frame{c0, c1, c2, c3, c4, c5, c6, c7, bx, by, bz, sz, ntx, nty, ntz, t1, nx, ny, nz} <> stack)
-      }
-
-def advance(
-  +c0: Vox, +c1: Vox, +c2: Vox, +c3: Vox, +c4: Vox, +c5: Vox, +c6: Vox, +c7: Vox,
-  +bx: F32, +by: F32, +bz: F32, +sz: F32,
-  +tx: F32, +ty: F32, +tz: F32, +t1: F32,
-  +cx: Bool, +cy: Bool, +cz: Bool,
-  stack: List<&2, Frame>
-) -> March:
-  +tn = child_t(tx, ty, tz, t1)
-  stepped((tn >= t1 : F32), c0, c1, c2, c3, c4, c5, c6, c7, bx, by, bz, sz, tx, ty, tz, tn, t1, cx, cy, cz, stack)
-
-def open_fork(
-  +c0: Vox, +c1: Vox, +c2: Vox, +c3: Vox, +c4: Vox, +c5: Vox, +c6: Vox, +c7: Vox,
-  +bx: F32, +by: F32, +bz: F32, +sz: F32, +t0: F32, +t1: F32,
-  stack: List<&2, Frame>,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> March:
-  +h = (sz * 0.5 : F32)
-  +mx = (bx + h : F32)
-  +my = (by + h : F32)
-  +mz = (bz + h : F32)
-  +tmx = plane_t(ox, dx, mx)
-  +tmy = plane_t(oy, dy, my)
-  +tmz = plane_t(oz, dz, mz)
-  +px = (ox + (dx * t0) : F32)
-  +py = (oy + (dy * t0) : F32)
-  +pz = (oz + (dz * t0) : F32)
-  +xpos = (dx >= 0.0 : F32)
-  +ypos = (dy >= 0.0 : F32)
-  +zpos = (dz >= 0.0 : F32)
-  +cx = axis_high(tiny(dx), xpos, t0, tmx, px, mx)
-  +cy = axis_high(tiny(dy), ypos, t0, tmy, py, my)
-  +cz = axis_high(tiny(dz), zpos, t0, tmz, pz, mz)
-  +tx = axis_next(cx, xpos, tmx)
-  +ty = axis_next(cy, ypos, tmy)
-  +tz = axis_next(cz, zpos, tmz)
-  Down{
-    pick8(cx, cy, cz, c0, c1, c2, c3, c4, c5, c6, c7),
-    pick_f(cx, mx, bx),
-    pick_f(cy, my, by),
-    pick_f(cz, mz, bz),
-    h, t0, child_t(tx, ty, tz, t1),
-    (Frame{c0, c1, c2, c3, c4, c5, c6, c7, bx, by, bz, sz, tx, ty, tz, t1, cx, cy, cz} <> stack)
-  }
-
-def open_node(
-  node: Vox, +bx: F32, +by: F32, +bz: F32, +sz: F32, +t0: F32, +t1: F32,
-  stack: List<&2, Frame>,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> March:
-  match node:
-    case Air{}:
-      pop_stack(stack)
-    case Leaf{+cr, +cg, +cb, +refl, +nx, +ny, +nz}:
-      leaf_march((t0 > 0.001 : F32), cr, cg, cb, refl, nx, ny, nz, t0, stack, ox, oy, oz, dx, dy, dz)
-    case Fork{+c0, +c1, +c2, +c3, +c4, +c5, +c6, +c7}:
-      open_fork(c0, c1, c2, c3, c4, c5, c6, c7, bx, by, bz, sz, t0, t1, stack, ox, oy, oz, dx, dy, dz)
-
-def enter_down(
-  past: Bool, +node: Vox,
-  +bx: F32, +by: F32, +bz: F32, +sz: F32, +t0: F32, +t1: F32,
-  stack: List<&2, Frame>,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> March:
-  match past:
-    case True{}:
-      pop_stack(stack)
-    case False{}:
-      open_node(node, bx, by, bz, sz, t0, t1, stack, ox, oy, oz, dx, dy, dz)
-
-def march(
-  fuel: Nat, st: March,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> Hit:
-  match fuel st:
-    case 0n Down{node, bx, by, bz, sz, t0, t1, stack}:
-      Miss{}
-    case 0n Side{frame, stack}:
-      Miss{}
-    case 0n Found{hit}:
-      hit
-    case 1n+p Found{hit}:
-      hit
-    case 1n+p Down{node, +bx, +by, +bz, +sz, +t0, +t1, stack}:
-      march(p, enter_down((t0 > t1 : F32), node, bx, by, bz, sz, t0, t1, stack, ox, oy, oz, dx, dy, dz), ox, oy, oz, dx, dy, dz)
-    case 1n+p Side{Frame{+c0, +c1, +c2, +c3, +c4, +c5, +c6, +c7, +bx, +by, +bz, +sz, +tx, +ty, +tz, +t1, +cx, +cy, +cz}, stack}:
-      march(p, advance(c0, c1, c2, c3, c4, c5, c6, c7, bx, by, bz, sz, tx, ty, tz, t1, cx, cy, cz, stack), ox, oy, oz, dx, dy, dz)
-
-def shoot_span(
-  ok: Bool, +lo: F32, +hi: F32, +tree: Vox, +hop: Nat,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> Hit:
-  match ok:
-    case False{}:
-      Miss{}
-    case True{}:
-      march(hop, Down{tree, vol_x(), vol_y(), vol_z(), vol_s(), F32.max(lo, 0.0), hi, Nil{}}, ox, oy, oz, dx, dy, dz)
-
-def from_span(
-  sp: Span, tree: Vox, hop: Nat,
-  +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32
-) -> Hit:
-  match sp:
-    case Span{+lo, +hi}:
-      shoot_span((hi >= lo : F32) && (hi > 0.001 : F32), lo, hi, tree, hop, ox, oy, oz, dx, dy, dz)
-
-def cast_tree(tree: Vox, hop: Nat, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Hit:
-  +x0 = vol_x()
-  +y0 = vol_y()
-  +z0 = vol_z()
-  +s = vol_s()
-  from_span(
-    cast_span(
-      axis_span(ox, dx, x0, (x0 + s : F32)),
-      axis_span(oy, dy, y0, (y0 + s : F32)),
-      axis_span(oz, dz, z0, (z0 + s : F32))),
-    tree, hop, ox, oy, oz, dx, dy, dz)
+# The floor is a sphere of radius 100 whose top is the plane y = 0.
+def ground_tip() -> Knot:
+  orb_tip(0.0, F32.neg(100.0), 0.0, 100.0, 0.0, 0.0, 0.0, 0.18, 1)
 
 def block_saw(h: Hit) -> Bool:
   match h:
@@ -839,11 +792,43 @@ def block_saw(h: Hit) -> Bool:
     case Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}:
       True{}
 
-def closest(tree: Vox, hop: Nat, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Hit:
-  cast_tree(tree, hop, ox, oy, oz, dx, dy, dz)
+def hit_shape(
+  shape: Shape, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
+) -> Hit:
+  match shape:
+    case Orb{cx, cy, cz, rad, cr, cg, cb, refl, kind}:
+      hit_sph(ox, oy, oz, dx, dy, dz, cx, cy, cz, rad, cr, cg, cb, refl, kind, best)
+    case Beam{cyl}:
+      hit_cyl(ox, oy, oz, dx, dy, dz, cyl, best)
+    case Blade{tri}:
+      hit_tri(ox, oy, oz, dx, dy, dz, tri, best)
 
-def blocked(tree: Vox, hop: Nat, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Bool:
-  block_saw(closest(tree, hop, ox, oy, oz, dx, dy, dz))
+def touches(+node: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Bool:
+  match node:
+    case Tip{+sx, +sy, +sz, +sr, +shape}:
+      sph_blocks(ox, oy, oz, dx, dy, dz, sx, sy, sz, sr)
+    case Bin{+sx, +sy, +sz, +sr, +a, +b}:
+      sph_blocks(ox, oy, oz, dx, dy, dz, sx, sy, sz, sr)
+
+# go is the sphere test for this node. The node itself is the shrinking argument.
+def walk(
+  node: Knot, go: Bool, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32, best: Hit
+) -> Hit:
+  match node go:
+    case _ False{}:
+      best
+    case Tip{+sx, +sy, +sz, +sr, shape} True{}:
+      hit_shape(shape, ox, oy, oz, dx, dy, dz, best)
+    case Bin{+sx, +sy, +sz, +sr, +a, +b} True{}:
+      walk(
+        a, touches(a, ox, oy, oz, dx, dy, dz), ox, oy, oz, dx, dy, dz,
+        walk(b, touches(b, ox, oy, oz, dx, dy, dz), ox, oy, oz, dx, dy, dz, best))
+
+def closest(+tree: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Hit:
+  walk(tree, touches(tree, ox, oy, oz, dx, dy, dz), ox, oy, oz, dx, dy, dz, Miss{})
+
+def blocked(+tree: Knot, +ox: F32, +oy: F32, +oz: F32, +dx: F32, +dy: F32, +dz: F32) -> Bool:
+  block_saw(closest(tree, ox, oy, oz, dx, dy, dz))
 
 def branches() -> List<&2, Cyl>:
   Cyl{F32.neg(1.90), F32.neg(0.02), F32.neg(1.25), F32.neg(1.90), 0.46, F32.neg(1.25), 0.155, 0.112, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.90), 0.46, F32.neg(1.25), F32.neg(1.90), 0.92, F32.neg(1.25), 0.112, 0.070, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.90), 0.92, F32.neg(1.25), F32.neg(1.90), 1.36, F32.neg(1.25), 0.070, 0.038, 0.40, 0.24, 0.11, 0.04} <> (Cyl{F32.neg(1.87), 0.36, F32.neg(1.13), F32.neg(1.80), 0.68, F32.neg(0.76), 0.056, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.80), 0.68, F32.neg(0.76), F32.neg(1.92), 0.84, F32.neg(0.53), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.80), 0.68, F32.neg(0.76), F32.neg(1.55), 0.92, F32.neg(0.57), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.80), 0.48, F32.neg(1.20), F32.neg(1.41), 0.86, F32.neg(0.99), 0.051, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.41), 0.86, F32.neg(0.99), F32.neg(1.28), 1.02, F32.neg(0.76), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.41), 0.86, F32.neg(0.99), F32.neg(1.08), 1.10, F32.neg(1.03), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.81), 0.56, F32.neg(1.30), F32.neg(1.39), 0.90, F32.neg(1.52), 0.047, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.39), 0.90, F32.neg(1.52), F32.neg(1.09), 1.06, F32.neg(1.49), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.39), 0.90, F32.neg(1.52), F32.neg(1.24), 1.14, F32.neg(1.78), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.88), 0.64, F32.neg(1.34), F32.neg(1.78), 1.06, F32.neg(1.80), 0.044, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.78), 1.06, F32.neg(1.80), F32.neg(1.56), 1.22, F32.neg(1.97), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.78), 1.06, F32.neg(1.80), F32.neg(1.92), 1.30, F32.neg(2.06), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.95), 0.74, F32.neg(1.32), F32.neg(2.19), 1.10, F32.neg(1.68), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.19), 1.10, F32.neg(1.68), F32.neg(2.18), 1.26, F32.neg(1.94), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.19), 1.10, F32.neg(1.68), F32.neg(2.51), 1.34, F32.neg(1.78), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.98), 0.82, F32.neg(1.26), F32.neg(2.40), 1.22, F32.neg(1.32), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.40), 1.22, F32.neg(1.32), F32.neg(2.61), 1.38, F32.neg(1.50), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.40), 1.22, F32.neg(1.32), F32.neg(2.70), 1.46, F32.neg(1.19), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.95), 0.92, F32.neg(1.20), F32.neg(2.24), 1.36, F32.neg(0.94), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(2.24), 1.36, F32.neg(0.94), F32.neg(2.54), 1.52, F32.neg(0.91), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(2.24), 1.36, F32.neg(0.94), F32.neg(2.32), 1.60, F32.neg(0.66), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.87), 1.04, F32.neg(1.20), F32.neg(1.73), 1.50, F32.neg(0.93), 0.040, 0.030, 0.36, 0.22, 0.11, 0.03} <> (Cyl{F32.neg(1.73), 1.50, F32.neg(0.93), F32.neg(1.77), 1.66, F32.neg(0.68), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Cyl{F32.neg(1.73), 1.50, F32.neg(0.93), F32.neg(1.43), 1.74, F32.neg(0.80), 0.030, 0.028, 0.32, 0.19, 0.10, 0.03} <> (Nil{})))))))))))))))))))))))))))
@@ -851,19 +836,15 @@ def branches() -> List<&2, Cyl>:
 def leaves() -> List<&2, Tri>:
   Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(1.94), 0.91, F32.neg(0.63), F32.neg(1.96), 1.04, F32.neg(0.43), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(1.96), 1.04, F32.neg(0.43), F32.neg(1.90), 0.81, F32.neg(0.40), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(2.04), 0.86, F32.neg(0.57), F32.neg(1.96), 1.04, F32.neg(0.43), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(1.96), 1.04, F32.neg(0.43), F32.neg(1.80), 0.87, F32.neg(0.46), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(2.02), 0.81, F32.neg(0.45), F32.neg(1.96), 1.04, F32.neg(0.43), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.88), 0.69, F32.neg(0.60), F32.neg(1.96), 1.04, F32.neg(0.43), F32.neg(1.82), 0.92, F32.neg(0.58), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.50), 0.89, F32.neg(0.44), F32.neg(1.46), 1.12, F32.neg(0.50), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.46), 1.12, F32.neg(0.50), F32.neg(1.57), 1.00, F32.neg(0.67), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.42), 0.89, F32.neg(0.54), F32.neg(1.46), 1.12, F32.neg(0.50), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.46), 1.12, F32.neg(0.50), F32.neg(1.65), 1.00, F32.neg(0.57), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.45), 0.94, F32.neg(0.66), F32.neg(1.46), 1.12, F32.neg(0.50), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.61), 0.77, F32.neg(0.62), F32.neg(1.46), 1.12, F32.neg(0.50), F32.neg(1.62), 0.95, F32.neg(0.46), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.83), 0.45, F32.neg(0.93), F32.neg(1.80), 0.62, F32.neg(0.96), F32.neg(1.81), 0.72, F32.neg(0.81), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.83), 0.45, F32.neg(0.93), F32.neg(1.81), 0.72, F32.neg(0.81), F32.neg(1.84), 0.54, F32.neg(0.78), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.83), 0.45, F32.neg(0.93), F32.neg(1.92), 0.60, F32.neg(0.89), F32.neg(1.81), 0.72, F32.neg(0.81), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.83), 0.45, F32.neg(0.93), F32.neg(1.81), 0.72, F32.neg(0.81), F32.neg(1.72), 0.57, F32.neg(0.86), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.40), 1.06, F32.neg(0.71), F32.neg(1.23), 1.22, F32.neg(0.67), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.23), 1.22, F32.neg(0.67), F32.neg(1.15), 1.03, F32.neg(0.80), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.30), 1.00, F32.neg(0.63), F32.neg(1.23), 1.22, F32.neg(0.67), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.23), 1.22, F32.neg(0.67), F32.neg(1.24), 1.09, F32.neg(0.87), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.18), 0.99, F32.neg(0.68), F32.neg(1.23), 1.22, F32.neg(0.67), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.32), 0.87, F32.neg(0.83), F32.neg(1.23), 1.22, F32.neg(0.67), F32.neg(1.36), 1.10, F32.neg(0.82), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(0.96), 1.06, F32.neg(1.07), F32.neg(0.96), 1.30, F32.neg(1.04), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(0.96), 1.30, F32.neg(1.04), F32.neg(1.17), 1.19, F32.neg(0.99), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(1.04), 1.11, F32.neg(1.16), F32.neg(0.96), 1.30, F32.neg(1.04), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(0.96), 1.30, F32.neg(1.04), F32.neg(1.08), 1.15, F32.neg(0.90), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(1.15), 1.17, F32.neg(1.12), F32.neg(0.96), 1.30, F32.neg(1.04), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.16), 0.95, F32.neg(1.02), F32.neg(0.96), 1.30, F32.neg(1.04), F32.neg(0.98), 1.08, F32.neg(0.95), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.59), 0.61, F32.neg(1.09), F32.neg(1.47), 0.70, F32.neg(0.98), F32.neg(1.47), 0.88, F32.neg(1.02), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.59), 0.61, F32.neg(1.09), F32.neg(1.47), 0.88, F32.neg(1.02), F32.neg(1.59), 0.79, F32.neg(1.12), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.59), 0.61, F32.neg(1.09), F32.neg(1.46), 0.73, F32.neg(1.12), F32.neg(1.47), 0.88, F32.neg(1.02), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.59), 0.61, F32.neg(1.09), F32.neg(1.47), 0.88, F32.neg(1.02), F32.neg(1.60), 0.76, F32.neg(0.99), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(1.02), 1.05, F32.neg(1.37), F32.neg(0.97), 1.26, F32.neg(1.48), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(0.97), 1.26, F32.neg(1.48), F32.neg(1.13), 1.12, F32.neg(1.60), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(0.96), 1.02, F32.neg(1.48), F32.neg(0.97), 1.26, F32.neg(1.48), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(0.97), 1.26, F32.neg(1.48), F32.neg(1.19), 1.15, F32.neg(1.49), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(1.01), 1.06, F32.neg(1.60), F32.neg(0.97), 1.26, F32.neg(1.48), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.18), 0.91, F32.neg(1.50), F32.neg(0.97), 1.26, F32.neg(1.48), F32.neg(1.14), 1.11, F32.neg(1.38), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.30), 1.14, F32.neg(1.90), F32.neg(1.18), 1.35, F32.neg(1.87), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.18), 1.35, F32.neg(1.87), F32.neg(1.16), 1.20, F32.neg(1.68), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.36), 1.20, F32.neg(1.80), F32.neg(1.18), 1.35, F32.neg(1.87), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.18), 1.35, F32.neg(1.87), F32.neg(1.10), 1.14, F32.neg(1.78), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.29), 1.23, F32.neg(1.69), F32.neg(1.18), 1.35, F32.neg(1.87), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.28), 0.99, F32.neg(1.71), F32.neg(1.18), 1.35, F32.neg(1.87), F32.neg(1.17), 1.11, F32.neg(1.89), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.58), 0.67, F32.neg(1.42), F32.neg(1.50), 0.76, F32.neg(1.55), F32.neg(1.45), 0.93, F32.neg(1.49), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.58), 0.67, F32.neg(1.42), F32.neg(1.45), 0.93, F32.neg(1.49), F32.neg(1.53), 0.83, F32.neg(1.36), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.58), 0.67, F32.neg(1.42), F32.neg(1.60), 0.83, F32.neg(1.48), F32.neg(1.45), 0.93, F32.neg(1.49), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.58), 0.67, F32.neg(1.42), F32.neg(1.45), 0.93, F32.neg(1.49), F32.neg(1.43), 0.76, F32.neg(1.43), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.45), 1.18, F32.neg(2.03), F32.neg(1.47), 1.42, F32.neg(2.04), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.47), 1.42, F32.neg(2.04), F32.neg(1.65), 1.31, F32.neg(1.93), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.55), 1.20, F32.neg(2.10), F32.neg(1.47), 1.42, F32.neg(2.04), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.47), 1.42, F32.neg(2.04), F32.neg(1.55), 1.28, F32.neg(1.86), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.66), 1.27, F32.neg(2.05), F32.neg(1.47), 1.42, F32.neg(2.04), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.63), 1.07, F32.neg(1.92), F32.neg(1.47), 1.42, F32.neg(2.04), F32.neg(1.44), 1.22, F32.neg(1.91), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(2.02), 1.34, F32.neg(1.99), F32.neg(1.97), 1.51, F32.neg(2.15), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(1.97), 1.51, F32.neg(2.15), F32.neg(1.83), 1.31, F32.neg(2.16), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(1.90), 1.38, F32.neg(1.96), F32.neg(1.97), 1.51, F32.neg(2.15), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(1.97), 1.51, F32.neg(2.15), F32.neg(1.95), 1.27, F32.neg(2.19), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(1.81), 1.37, F32.neg(2.04), F32.neg(1.97), 1.51, F32.neg(2.15), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.88), 1.15, F32.neg(1.99), F32.neg(1.97), 1.51, F32.neg(2.15), F32.neg(2.04), 1.29, F32.neg(2.11), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.83), 0.80, F32.neg(1.60), F32.neg(1.91), 0.95, F32.neg(1.64), F32.neg(1.80), 1.07, F32.neg(1.73), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.83), 0.80, F32.neg(1.60), F32.neg(1.80), 1.07, F32.neg(1.73), F32.neg(1.72), 0.91, F32.neg(1.68), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.83), 0.80, F32.neg(1.60), F32.neg(1.79), 0.97, F32.neg(1.57), F32.neg(1.80), 1.07, F32.neg(1.73), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.83), 0.80, F32.neg(1.60), F32.neg(1.80), 1.07, F32.neg(1.73), F32.neg(1.84), 0.89, F32.neg(1.75), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.26), 1.24, F32.neg(2.05), F32.neg(2.18), 1.46, F32.neg(2.04), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.18), 1.46, F32.neg(2.04), F32.neg(2.11), 1.33, F32.neg(1.85), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.31), 1.29, F32.neg(1.94), F32.neg(2.18), 1.46, F32.neg(2.04), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.18), 1.46, F32.neg(2.04), F32.neg(2.05), 1.28, F32.neg(1.96), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.24), 1.34, F32.neg(1.84), F32.neg(2.18), 1.46, F32.neg(2.04), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.19), 1.11, F32.neg(1.86), F32.neg(2.18), 1.46, F32.neg(2.04), F32.neg(2.13), 1.23, F32.neg(2.05), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.45), 1.42, F32.neg(1.70), F32.neg(2.62), 1.54, F32.neg(1.82), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.62), 1.54, F32.neg(1.82), F32.neg(2.60), 1.31, F32.neg(1.88), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.41), 1.42, F32.neg(1.82), F32.neg(2.62), 1.54, F32.neg(1.82), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.62), 1.54, F32.neg(1.82), F32.neg(2.64), 1.31, F32.neg(1.75), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.49), 1.37, F32.neg(1.91), F32.neg(2.62), 1.54, F32.neg(1.82), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.43), 1.19, F32.neg(1.76), F32.neg(2.62), 1.54, F32.neg(1.82), F32.neg(2.56), 1.37, F32.neg(1.66), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.08), 0.86, F32.neg(1.52), F32.neg(2.06), 1.04, F32.neg(1.50), F32.neg(2.16), 1.13, F32.neg(1.63), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.08), 0.86, F32.neg(1.52), F32.neg(2.16), 1.13, F32.neg(1.63), F32.neg(2.18), 0.95, F32.neg(1.64), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.08), 0.86, F32.neg(1.52), F32.neg(2.04), 0.99, F32.neg(1.64), F32.neg(2.16), 1.13, F32.neg(1.63), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.08), 0.86, F32.neg(1.52), F32.neg(2.16), 1.13, F32.neg(1.63), F32.neg(2.20), 1.00, F32.neg(1.51), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.72), 1.40, F32.neg(1.41), F32.neg(2.70), 1.58, F32.neg(1.56), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.70), 1.58, F32.neg(1.56), F32.neg(2.53), 1.41, F32.neg(1.59), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.60), 1.45, F32.neg(1.39), F32.neg(2.70), 1.58, F32.neg(1.56), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.70), 1.58, F32.neg(1.56), F32.neg(2.64), 1.35, F32.neg(1.62), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.51), 1.46, F32.neg(1.48), F32.neg(2.70), 1.58, F32.neg(1.56), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.55), 1.23, F32.neg(1.44), F32.neg(2.70), 1.58, F32.neg(1.56), F32.neg(2.74), 1.35, F32.neg(1.53), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.63), 1.55, F32.neg(1.26), F32.neg(2.80), 1.66, F32.neg(1.14), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.80), 1.66, F32.neg(1.14), F32.neg(2.79), 1.43, F32.neg(1.10), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.74), 1.50, F32.neg(1.31), F32.neg(2.80), 1.66, F32.neg(1.14), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.80), 1.66, F32.neg(1.14), F32.neg(2.68), 1.47, F32.neg(1.05), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.82), 1.44, F32.neg(1.23), F32.neg(2.80), 1.66, F32.neg(1.14), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.62), 1.31, F32.neg(1.22), F32.neg(2.80), 1.66, F32.neg(1.14), F32.neg(2.60), 1.53, F32.neg(1.13), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.21), 0.96, F32.neg(1.29), F32.neg(2.23), 1.11, F32.neg(1.39), F32.neg(2.33), 1.24, F32.neg(1.31), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.21), 0.96, F32.neg(1.29), F32.neg(2.33), 1.24, F32.neg(1.31), F32.neg(2.31), 1.09, F32.neg(1.21), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.21), 0.96, F32.neg(1.29), F32.neg(2.35), 1.06, F32.neg(1.35), F32.neg(2.33), 1.24, F32.neg(1.31), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.21), 0.96, F32.neg(1.29), F32.neg(2.33), 1.24, F32.neg(1.31), F32.neg(2.19), 1.14, F32.neg(1.26), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.48), 1.58, F32.neg(0.82), F32.neg(2.66), 1.72, F32.neg(0.90), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.66), 1.72, F32.neg(0.90), F32.neg(2.63), 1.50, F32.neg(1.01), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.45), 1.61, F32.neg(0.94), F32.neg(2.66), 1.72, F32.neg(0.90), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.66), 1.72, F32.neg(0.90), F32.neg(2.66), 1.48, F32.neg(0.88), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.52), 1.57, F32.neg(1.04), F32.neg(2.66), 1.72, F32.neg(0.90), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.45), 1.37, F32.neg(0.92), F32.neg(2.66), 1.72, F32.neg(0.90), F32.neg(2.59), 1.52, F32.neg(0.79), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.42), 1.65, F32.neg(0.73), F32.neg(2.34), 1.81, F32.neg(0.56), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.34), 1.81, F32.neg(0.56), F32.neg(2.22), 1.60, F32.neg(0.57), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.44), 1.60, F32.neg(0.61), F32.neg(2.34), 1.81, F32.neg(0.56), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.34), 1.81, F32.neg(0.56), F32.neg(2.20), 1.66, F32.neg(0.68), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.34), 1.57, F32.neg(0.53), F32.neg(2.34), 1.81, F32.neg(0.56), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.30), 1.45, F32.neg(0.73), F32.neg(2.34), 1.81, F32.neg(0.56), F32.neg(2.29), 1.68, F32.neg(0.76), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(2.11), 1.09, F32.neg(1.06), F32.neg(2.22), 1.23, F32.neg(1.10), F32.neg(2.20), 1.37, F32.neg(0.98), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.11), 1.09, F32.neg(1.06), F32.neg(2.20), 1.37, F32.neg(0.98), F32.neg(2.09), 1.23, F32.neg(0.94), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(2.11), 1.09, F32.neg(1.06), F32.neg(2.23), 1.19, F32.neg(0.96), F32.neg(2.20), 1.37, F32.neg(0.98), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(2.11), 1.09, F32.neg(1.06), F32.neg(2.20), 1.37, F32.neg(0.98), F32.neg(2.08), 1.27, F32.neg(1.08), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.74), 1.74, F32.neg(0.78), F32.neg(1.79), 1.86, F32.neg(0.58), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.79), 1.86, F32.neg(0.58), F32.neg(1.80), 1.63, F32.neg(0.55), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.87), 1.72, F32.neg(0.75), F32.neg(1.79), 1.86, F32.neg(0.58), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.79), 1.86, F32.neg(0.58), F32.neg(1.68), 1.65, F32.neg(0.58), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.90), 1.66, F32.neg(0.64), F32.neg(1.79), 1.86, F32.neg(0.58), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.76), 1.51, F32.neg(0.75), F32.neg(1.79), 1.86, F32.neg(0.58), F32.neg(1.65), 1.71, F32.neg(0.69), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.43), 1.75, F32.neg(0.67), F32.neg(1.32), 1.94, F32.neg(0.76), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.32), 1.94, F32.neg(0.76), F32.neg(1.40), 1.79, F32.neg(0.93), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.32), 1.70, F32.neg(0.73), F32.neg(1.32), 1.94, F32.neg(0.76), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.32), 1.94, F32.neg(0.76), F32.neg(1.50), 1.83, F32.neg(0.87), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.31), 1.72, F32.neg(0.86), F32.neg(1.32), 1.94, F32.neg(0.76), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.50), 1.59, F32.neg(0.84), F32.neg(1.32), 1.94, F32.neg(0.76), F32.neg(1.52), 1.81, F32.neg(0.74), 0.20, 0.52, 0.17, 0.05} <> (Tri{F32.neg(1.79), 1.22, F32.neg(1.05), F32.neg(1.87), 1.37, F32.neg(0.97), F32.neg(1.75), 1.51, F32.neg(0.97), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.79), 1.22, F32.neg(1.05), F32.neg(1.75), 1.51, F32.neg(0.97), F32.neg(1.68), 1.36, F32.neg(1.05), 0.08, 0.32, 0.11, 0.05} <> (Tri{F32.neg(1.79), 1.22, F32.neg(1.05), F32.neg(1.74), 1.33, F32.neg(0.92), F32.neg(1.75), 1.51, F32.neg(0.97), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.79), 1.22, F32.neg(1.05), F32.neg(1.75), 1.51, F32.neg(0.97), F32.neg(1.81), 1.39, F32.neg(1.10), 0.24, 0.56, 0.19, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(1.93), 1.46, F32.neg(1.39), F32.neg(1.89), 1.65, F32.neg(1.25), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(1.89), 1.65, F32.neg(1.25), F32.neg(1.87), 1.46, F32.neg(1.11), 0.15, 0.46, 0.14, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(2.03), 1.47, F32.neg(1.29), F32.neg(1.89), 1.65, F32.neg(1.25), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(1.89), 1.65, F32.neg(1.25), F32.neg(1.77), 1.45, F32.neg(1.21), 0.10, 0.36, 0.12, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(2.00), 1.46, F32.neg(1.16), F32.neg(1.89), 1.65, F32.neg(1.25), 0.12, 0.40, 0.13, 0.05} <> (Tri{F32.neg(1.91), 1.27, F32.neg(1.25), F32.neg(1.89), 1.65, F32.neg(1.25), F32.neg(1.80), 1.46, F32.neg(1.34), 0.12, 0.40, 0.13, 0.05} <> (Nil{}))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
-# Floor, then the tree, then the five spheres so a later surface overwrites.
-def scene() -> Vox:
-  paint_ball(
-    paint_ball(
-      paint_ball(
-        paint_ball(
-          paint_ball(
-            paint_tris(leaves(), paint_cyls(branches(), paint_floor(Air{}))),
-            F32.neg(1.05), 0.50, 0.15, 0.50, 0.86, 0.16, 0.12, 0.05),
-          0.15, 0.50, F32.neg(0.35), 0.50, 0.93, 0.93, 0.95, 0.90),
-        1.25, 0.50, 0.25, 0.50, 0.16, 0.32, 0.86, 0.22),
-      F32.neg(0.35), 0.22, 1.05, 0.22, 0.96, 0.66, 0.16, 0.38),
-    0.85, 0.18, 1.20, 0.18, 0.22, 0.72, 0.32, 0.12)
+# Ground sphere beside the cluster of spheres, frustums, and leaves.
+def scene() -> Knot:
+  join(
+    fold_tree(
+      32n,
+      List.append(&2, Knot,
+        sphere_row(),
+        List.append(&2, Knot, beams_of(branches()), blades_of(leaves())))),
+    ground_tip())
 
 def vis_of(in_shadow: Bool) -> F32:
   match in_shadow:
@@ -876,9 +857,9 @@ def vis_of(in_shadow: Bool) -> F32:
 def surface(
   +px: F32, +py: F32, +pz: F32, +nx: F32, +ny: F32, +nz: F32,
   +cr: F32, +cg: F32, +cb: F32, +dx: F32, +dy: F32, +dz: F32,
-  tree: Vox, hop: Nat
+  tree: Knot
 ) -> Vec3:
-  +eps = {0.2 : F32}
+  +eps = {0.02 : F32}
   +ox = (px + nx * eps : F32)
   +oy = (py + ny * eps : F32)
   +oz = (pz + nz * eps : F32)
@@ -887,7 +868,7 @@ def surface(
   +lz = {F32.neg(0.49312897) : F32}
   +ndotl = max0((nx * lx + ny * ly + nz * lz : F32))
   +ndotf = max0((nx * 0.57543534 + ny * 0.51789180 + nz * 0.63297887 : F32))
-  +vis = vis_of(blocked(tree, hop, ox, oy, oz, lx, ly, lz))
+  +vis = vis_of(blocked(tree, ox, oy, oz, lx, ly, lz))
   +rx = ((ndotl * (nx * 2.0)) - lx : F32)
   +ry = ((ndotl * (ny * 2.0)) - ly : F32)
   +rz = ((ndotl * (nz * 2.0)) - lz : F32)
@@ -907,7 +888,7 @@ type Step is Data:
   Go{ox: F32, oy: F32, oz: F32, dx: F32, dy: F32, dz: F32}
   Saw{hit: Hit, dx: F32, dy: F32, dz: F32}
 
-def trace(+n: Nat, step: Step, +tree: Vox, +hop: Nat) -> Vec3:
+def trace(+n: Nat, step: Step, +tree: Knot) -> Vec3:
   match n step:
     case 0n Go{ox, oy, oz, dx, dy, dz}:
       sky(dx, dy, dz)
@@ -916,19 +897,19 @@ def trace(+n: Nat, step: Step, +tree: Vox, +hop: Nat) -> Vec3:
     case 0n Saw{Hit{t, px, py, pz, nx, ny, nz, cr, cg, cb, refl}, dx, dy, dz}:
       sky(dx, dy, dz)
     case 1n+p Go{ox, oy, oz, +dx, +dy, +dz}:
-      trace(p, Saw{closest(tree, hop, ox, oy, oz, dx, dy, dz), dx, dy, dz}, tree, hop)
+      trace(p, Saw{closest(tree, ox, oy, oz, dx, dy, dz), dx, dy, dz}, tree)
     case 1n+p Saw{Miss{}, dx, dy, dz}:
       sky(dx, dy, dz)
     case 1n+p Saw{Hit{t, +px, +py, +pz, +nx, +ny, +nz, cr, cg, cb, refl}, +dx, +dy, +dz}:
-      +eps = {0.2 : F32}
+      +eps = {0.02 : F32}
       +ox = (px + nx * eps : F32)
       +oy = (py + ny * eps : F32)
       +oz = (pz + nz * eps : F32)
       +nd = (dx * nx + dy * ny + dz * nz : F32)
       +k = (nd * 2.0 : F32)
       mix3(
-        surface(px, py, pz, nx, ny, nz, cr, cg, cb, dx, dy, dz, tree, hop),
-        trace(p, Go{ox, oy, oz, (dx - k * nx : F32), (dy - k * ny : F32), (dz - k * nz : F32)}, tree, hop),
+        surface(px, py, pz, nx, ny, nz, cr, cg, cb, dx, dy, dz, tree),
+        trace(p, Go{ox, oy, oz, (dx - k * nx : F32), (dy - k * ny : F32), (dz - k * nz : F32)}, tree),
         refl)
 
 # --- camera and pixels ----------------------------------------------------
@@ -975,16 +956,16 @@ def orbit(+yaw: F32, +pitch: F32, +dist: F32, +sc: F32) -> Cam:
     (tz + (dist * cp) * cy : F32),
     tx, ty, tz, sc)
 
-def shoot(ex: F32, ey: F32, ez: F32, dir: Vec3, tree: Vox, hop: Nat) -> U32:
+def shoot(ex: F32, ey: F32, ez: F32, dir: Vec3, tree: Knot) -> U32:
   match dir:
     case V3{dx, dy, dz}:
-      pack(trace(6n, Go{ex, ey, ez, dx, dy, dz}, tree, hop))
+      pack(trace(6n, Go{ex, ey, ez, dx, dy, dz}, tree))
 
 def aim(
   +x: U32, +y: U32, +side: F32,
   ex: F32, ey: F32, ez: F32, fx: F32, fy: F32, fz: F32,
   rx: F32, ry: F32, rz: F32, ux: F32, uy: F32, uz: F32, +sc: F32,
-  tree: Vox, hop: Nat
+  tree: Knot
 ) -> U32:
   +u = ((U32.to_f32(x) + 0.5) / side - 0.5 : F32)
   +v = (0.5 - (U32.to_f32(y) + 0.5) / side : F32)
@@ -993,12 +974,12 @@ def aim(
   shoot(ex, ey, ez, norm3(
     (fx + rx * su + ux * sv : F32),
     (fy + ry * su + uy * sv : F32),
-    (fz + rz * su + uz * sv : F32)), tree, hop)
+    (fz + rz * su + uz * sv : F32)), tree)
 
-def pixel(+x: U32, +y: U32, +side: F32, cam: Cam, tree: Vox, hop: Nat) -> U32:
+def pixel(+x: U32, +y: U32, +side: F32, cam: Cam, tree: Knot) -> U32:
   match cam:
     case Cam{ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz, sc}:
-      aim(x, y, side, ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz, sc, tree, hop)
+      aim(x, y, side, ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz, sc, tree)
 
 # --- picture --------------------------------------------------------------
 
@@ -1021,15 +1002,15 @@ def cat_rows(a: Rows, b: Rows) -> Rows:
       RCons{row, cat_rows(rest, b)}
 
 # The square at (x, y) with side s = 2^k. Forks four ways down to a pixel.
-def block(+k: Nat, +x: U32, +y: U32, +s: U32, +side: F32, +cam: Cam, +tree: Vox, +hop: Nat) -> Rows:
+def block(+k: Nat, +x: U32, +y: U32, +s: U32, +side: F32, +cam: Cam, +tree: Knot) -> Rows:
   match k:
     case 0n:
-      RCons{bytes3(pixel(x, y, side, cam, tree, hop)), RNil{}}
+      RCons{bytes3(pixel(x, y, side, cam, tree)), RNil{}}
     case 1n+p:
       +h = U32.shrn(s, 1n)
       +x2 = (x + h : U32)
       +y2 = (y + h : U32)
-      a b c d = block(p, x, y, h, side, cam, tree, hop) block(p, x2, y, h, side, cam, tree, hop) block(p, x, y2, h, side, cam, tree, hop) block(p, x2, y2, h, side, cam, tree, hop)
+      a b c d = block(p, x, y, h, side, cam, tree) block(p, x2, y, h, side, cam, tree) block(p, x, y2, h, side, cam, tree) block(p, x2, y2, h, side, cam, tree)
       cat_rows(zip_rows(a, b), zip_rows(c, d))
 
 def onto(xs: List<&2, U32>, acc: List<&2, U32>) -> List<&2, U32>:
@@ -1046,8 +1027,8 @@ def flatten(rows: Rows, acc: List<&2, U32>) -> List<&2, U32>:
     case RCons{row, rest}:
       flatten(rest, onto(row, acc))
 
-def render(depth: Nat, side: U32, f: F32, cam: Cam, tree: Vox, hop: Nat) -> List<&2, U32>:
-  List.reverse(&2, U32, flatten(block(depth, 0, 0, side, f, cam, tree, hop), Nil{}))
+def render(depth: Nat, side: U32, f: F32, cam: Cam, tree: Knot) -> List<&2, U32>:
+  List.reverse(&2, U32, flatten(block(depth, 0, 0, side, f, cam, tree), Nil{}))
 
 # --- view -----------------------------------------------------------------
 # The page asks for /f SYYYY PPPP Z
@@ -1132,7 +1113,7 @@ def not_found() -> String:
   "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 def html_body(+side: U32) -> String:
-  "<!doctype html><html><head><meta charset='utf-8'><title>Voxel trace</title><style>"
+  "<!doctype html><html><head><meta charset='utf-8'><title>Sphere tree</title><style>"
     ++ "html,body{margin:0;height:100%;background:#12141a;color:#e8e6e1;font:15px sans-serif;}"
     ++ "body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;user-select:none;}"
     ++ "canvas{background:#000;cursor:crosshair;touch-action:none;}"
@@ -1204,24 +1185,24 @@ def send_text(listener: Listener, sock: Socket, text: String, next: Listener -> 
 def send_rendered(
   depth: Nat, +side: U32, f: F32,
   listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit),
-  tree: Vox, hop: Nat
+  tree: Knot
 ) -> IO(Unit):
   do IO<Unit>:
-    body : List<&2, U32> = render(depth, side, f, cam_of(view), tree, hop)
+    body : List<&2, U32> = render(depth, side, f, cam_of(view), tree)
     sent : Socket & Result<&1, &1, (U32 & String) & List<&2, U32>, Unit> <- TCP.send_bytes(sock, with_header(frame_header(side), body))
     sent_then(sent, listener, next)
 
-def send_frame(size: Size, listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit), tree: Vox, hop: Nat) -> IO(Unit):
+def send_frame(size: Size, listener: Listener, sock: Socket, view: View, next: Listener -> IO(Unit), tree: Knot) -> IO(Unit):
   match size:
     case Size{depth, +side, f}:
-      send_rendered(depth, side, f, listener, sock, view, next, tree, hop)
+      send_rendered(depth, side, f, listener, sock, view, next, tree)
 
-def route(size: Size, path: String, listener: Listener, sock: Socket, next: Listener -> IO(Unit), +tree: Vox, +hop: Nat) -> IO(Unit):
+def route(size: Size, path: String, listener: Listener, sock: Socket, next: Listener -> IO(Unit), +tree: Knot) -> IO(Unit):
   match path:
     case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{48}, rest}}}:
-      send_frame(size, listener, sock, view_of(48, rest), next, tree, hop)
+      send_frame(size, listener, sock, view_of(48, rest), next, tree)
     case SCon{Chr{47}, SCon{Chr{102}, SCon{Chr{49}, rest}}}:
-      send_frame(size, listener, sock, view_of(49, rest), next, tree, hop)
+      send_frame(size, listener, sock, view_of(49, rest), next, tree)
     case SCon{Chr{47}, SCon{Chr{32}, _}}:
       send_text(listener, sock, page(size), next)
     case _:
@@ -1229,11 +1210,11 @@ def route(size: Size, path: String, listener: Listener, sock: Socket, next: List
 
 def got_req(
   size: Size, listener: Listener, got: Socket & Result<&1, &1, U32 & String, Maybe<&1, String>>,
-  next: Listener -> IO(Unit), +tree: Vox, +hop: Nat
+  next: Listener -> IO(Unit), +tree: Knot
 ) -> IO(Unit):
   match got:
     case (sock, Done{Some{text}}):
-      route(size, String.drop(text, 4n), listener, sock, next, tree, hop)
+      route(size, String.drop(text, 4n), listener, sock, next, tree)
     case (sock, Done{None{}}):
       do IO<Unit>:
         Unit <- Socket.close(sock)
@@ -1243,33 +1224,33 @@ def got_req(
         Unit <- Socket.close(sock)
         next(listener)
 
-def read_one(size: Size, listener: Listener, sock: Socket, next: Listener -> IO(Unit), tree: Vox, hop: Nat) -> IO(Unit):
+def read_one(size: Size, listener: Listener, sock: Socket, next: Listener -> IO(Unit), tree: Knot) -> IO(Unit):
   do IO<Unit>:
     got : Socket & Result<&1, &1, U32 & String, Maybe<&1, String>> <- TCP.recv(sock, 8192)
-    got_req(size, listener, got, next, tree, hop)
+    got_req(size, listener, got, next, tree)
 
-def accepted(size: Size, got: Listener & Result<&1, &1, U32 & String, Socket>, next: Listener -> IO(Unit), +tree: Vox, +hop: Nat) -> IO(Unit):
+def accepted(size: Size, got: Listener & Result<&1, &1, U32 & String, Socket>, next: Listener -> IO(Unit), +tree: Knot) -> IO(Unit):
   match got:
     case (listener, Done{sock}):
-      read_one(size, listener, sock, next, tree, hop)
+      read_one(size, listener, sock, next, tree)
     case (listener, Fail{err}):
       do IO<Unit>:
         IO.print("accept ended")
         Listener.close(listener)
 
-def accept_one(size: Size, listener: Listener, next: Listener -> IO(Unit), tree: Vox, hop: Nat) -> IO(Unit):
+def accept_one(size: Size, listener: Listener, next: Listener -> IO(Unit), tree: Knot) -> IO(Unit):
   do IO<Unit>:
     got : Listener & Result<&1, &1, U32 & String, Socket> <- TCP.accept(listener)
-    accepted(size, got, next, tree, hop)
+    accepted(size, got, next, tree)
 
-def serve(fuel: Nat, +size: Size, listener: Listener, +tree: Vox, +hop: Nat) -> IO(Unit):
+def serve(fuel: Nat, +size: Size, listener: Listener, +tree: Knot) -> IO(Unit):
   match fuel:
     case 0n:
       do IO<Unit>:
         IO.print("stopping")
         Listener.close(listener)
     case 1n+left:
-      accept_one(size, listener, l => serve(left, size, l, tree, hop), tree, hop)
+      accept_one(size, listener, l => serve(left, size, l, tree), tree)
 
 def side_of(size: Size) -> U32:
   match size:
@@ -1278,12 +1259,11 @@ def side_of(size: Size) -> U32:
 
 def listen(+size: Size) -> IO(Unit):
   do IO<Unit>:
-    IO.print("building the octree")
-    tree : Vox = scene()
-    hop : Nat = 4096n
+    IO.print("building the sphere tree")
+    tree : Knot = scene()
     IO.print("ray tracer at http://127.0.0.1:8080/  side " ++ U32.show(side_of(size)))
     listener : Listener <- IO.try(Listener, TCP.listen("127.0.0.1", 8080))
-    serve(4294967295n, size, listener, tree, hop)
+    serve(4294967295n, size, listener, tree)
 
 def run(picked: Choice) -> IO(Unit):
   match picked:
